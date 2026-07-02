@@ -1490,16 +1490,18 @@ impl Loader {
     }
 }
 
-fn do_load(data: &[u8]) -> Result<PbDescriptor, String> {
+fn do_load(data_slices: &[&[u8]]) -> Result<PbDescriptor, String> {
     let mut loader = Loader::new();
-    let mut stream = StreamReader::new(data);
-    // FileDescriptorSet: repeated FileDescriptorProto file = 1;
-    while !stream.is_empty() {
-        let tag = stream.read_varint()? as u32;
-        if tag == pb_tag_ft(1, WireType::LengthDelimited) {
-            loader.read_file_descriptor(&mut stream)?;
-        } else {
-            skip_field(&mut stream, tag)?;
+    for data in data_slices {
+        let mut stream = StreamReader::new(data);
+        // FileDescriptorSet: repeated FileDescriptorProto file = 1;
+        while !stream.is_empty() {
+            let tag = stream.read_varint()? as u32;
+            if tag == pb_tag_ft(1, WireType::LengthDelimited) {
+                loader.read_file_descriptor(&mut stream)?;
+            } else {
+                skip_field(&mut stream, tag)?;
+            }
         }
     }
     loader.finalize()
@@ -1522,8 +1524,18 @@ fn get_thread_encode_buffer() -> &'static mut Buffer {
 // =========================================================================
 
 extern "C-unwind" fn pb_load(state: LuaState) -> c_int {
-    let data = unsafe { laux::lua_check_lstring(state, 1) };
-    match do_load(data) {
+    let nargs = unsafe { ffi::lua_gettop(state.as_ptr()) } as usize;
+    if nargs == 0 {
+        laux::lua_error(state, "protobuf.load: expected at least 1 argument (FileDescriptorSet data)".into());
+    }
+    // Collect each argument as a byte slice before handing them to do_load,
+    // so a late lua_check_lstring failure doesn't leave a partially-loaded
+    // descriptor in the global slot.
+    let mut slices: Vec<&[u8]> = Vec::with_capacity(nargs);
+    for i in 1..=nargs {
+        slices.push(unsafe { laux::lua_check_lstring(state, i as c_int) });
+    }
+    match do_load(&slices) {
         Ok(desc) => set_global_descriptor(Box::new(desc)),
         Err(e) => laux::lua_error(state, format!("protobuf.load error: {}", e)),
     }

@@ -49,9 +49,11 @@ protobuf.field_type = {
 --- read from disk. Loading replaces any previously loaded descriptor.
 ---
 --- Raises a Lua error if the descriptor cannot be parsed.
----@param data string Raw `FileDescriptorSet` bytes
+---@param data1 string Raw `FileDescriptorSet` bytes
+---@param data2? string Raw `FileDescriptorSet` bytes
+---@param ... string Additional `FileDescriptorSet` data
 ---@return boolean ok Always `true` on success
-function protobuf.load(data) end
+function protobuf.load(data1, data2, ...) end
 
 --- Encode a Lua table into a protobuf wire-format string.
 ---
