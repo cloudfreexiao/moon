@@ -200,6 +200,8 @@ mod lua_socket;
 mod lua_sqlx;
 #[path = "modules/lua_utils.rs"]
 mod lua_utils;
+#[path = "modules/lua_uuid.rs"]
+mod lua_uuid;
 #[path = "modules/lua_zset.rs"]
 mod lua_zset;
 #[path = "modules/lua_schema.rs"]
@@ -459,6 +461,7 @@ pub fn luaopen_custom_libs(state: LuaState) {
     lua_require!(state, "buffer", lua_buffer::luaopen_buffer);
     lua_require!(state, "seri", lua_seri::luaopen_seri);
     lua_require!(state, "utils", lua_utils::luaopen_utils);
+    lua_require!(state, "uuid", lua_uuid::luaopen_uuid);
     #[cfg(feature = "protobuf")]
     lua_require!(state, "protobuf", lua_protobuf::luaopen_protobuf);
     #[cfg(feature = "sqlx")]
