@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #define nullptr NULL
+#define MAX_DECODE_DEPTH 64
 
 /* Mirror of the Rust `JsonOptions` struct (crates/moon-runtime/src/modules/
  * lua_json.rs). It is `#[repr(C)]` there and stored in-place inside the shared
@@ -72,8 +73,14 @@ static const char *l_str2int(const char *s, size_t len, lua_Integer *result) {
     return s+i;
 }
 
-static void decode_one(lua_State* L, yyjson_val* value, const json_options* opt)
+static void decode_one(lua_State* L, yyjson_val* value, const json_options* opt, size_t depth)
 {
+    if (depth > MAX_DECODE_DEPTH)
+    {
+        luaL_error(L, "json.decode: too deep");
+        return;
+    }
+
     yyjson_type type = yyjson_get_type(value);
     switch (type)
     {
@@ -86,7 +93,7 @@ static void decode_one(lua_State* L, yyjson_val* value, const json_options* opt)
         yyjson_arr_iter_init(value, &iter);
         while (nullptr != (value = yyjson_arr_iter_next(&iter)))
         {
-            decode_one(L, value, opt);
+            decode_one(L, value, opt, depth + 1);
             lua_rawseti(L, -2, pos++);
         }
         if (opt->has_metatfield)
@@ -124,7 +131,7 @@ static void decode_one(lua_State* L, yyjson_val* value, const json_options* opt)
                 {
                     lua_pushlstring(L, key_str, key_len);
                 }
-                decode_one(L, val, opt);
+                decode_one(L, val, opt, depth + 1);
                 lua_rawset(L, -3);
             }
         }
@@ -211,7 +218,7 @@ LUALIB_API int lua_json_decode(lua_State* L)
     {
         return luaL_error(L, "decode error: %s code: %d at position: %d\n", err.msg, (int)err.code, (int)err.pos);
     }
-    decode_one(L, yyjson_doc_get_root(doc), opt);
+    decode_one(L, yyjson_doc_get_root(doc), opt, 0);
     yyjson_doc_free(doc);
     return 1;
 }
