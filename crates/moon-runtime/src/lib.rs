@@ -22,6 +22,7 @@ pub use moon_base::buffer;
 use buffer::Buffer;
 pub mod context;
 pub mod error;
+pub mod loader;
 pub mod log;
 
 /// Stack-allocated byte buffer. `data[0]` stores the length, `data[1..]` stores

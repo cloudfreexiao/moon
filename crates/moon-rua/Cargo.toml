@@ -1,0 +1,15 @@
+[package]
+name = "moon-rua"
+version = "0.1.0"
+edition = "2024"
+description = "Rua source loading and Lua traceback integration for moon_rs."
+
+[lib]
+name = "moon_rua"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+moon-runtime = { workspace = true }
+ruac = { workspace = true }
+rua-resources = { workspace = true }

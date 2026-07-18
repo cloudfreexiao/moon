@@ -22,9 +22,10 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 fn print_usage() {
     println!("Usage:");
-    println!("    moon_rs script.lua [args]\n");
+    println!("    moon_rs script.lua|script.rua [args]\n");
     println!("Examples:");
     println!("    moon_rs main.lua hello\n");
+    println!("    moon_rs main.rua hello\n");
 }
 
 fn setup_signal() {
@@ -157,15 +158,26 @@ async fn async_main() -> Result<()> {
         )));
     }
 
-    if path.extension().and_then(std::ffi::OsStr::to_str) != Some("lua") {
+    let is_rua = path.extension().and_then(std::ffi::OsStr::to_str) == Some("rua");
+    if !is_rua && path.extension().and_then(std::ffi::OsStr::to_str) != Some("lua") {
         print_usage();
         return Err(Error::Custom(format!(
-            "bootstrap is not a lua file: {}",
+            "bootstrap is not a Lua or Rua file: {}",
             bootstrap
         )));
     }
 
     let bootstrap_path = path.canonicalize()?;
+    if is_rua {
+        let runtime = moon_rua::compile_path(&bootstrap_path).map_err(Error::Custom)?;
+        CONTEXT.set_module_loader(runtime.clone());
+        CONTEXT.set_error_reporter(runtime.clone());
+    } else if let Some(runtime) =
+        moon_rua::try_load_precompiled(&bootstrap_path).map_err(Error::Custom)?
+    {
+        CONTEXT.set_module_loader(runtime.clone());
+        CONTEXT.set_error_reporter(runtime);
+    }
 
     argn += 1;
 
@@ -176,8 +188,16 @@ async fn async_main() -> Result<()> {
     }
     arg.push('}');
 
-    let contents = fs::read_to_string(&bootstrap_path)?;
-    if contents.contains("_G[\"__init__\"]") {
+    let contents = if is_rua {
+        None
+    } else {
+        Some(fs::read_to_string(&bootstrap_path)?)
+    };
+    if contents
+        .as_deref()
+        .is_some_and(|contents| contents.contains("_G[\"__init__\"]"))
+    {
+        let contents = contents.as_deref().unwrap_or_default();
         //has init options
         unsafe {
             let lua = LuaState::new(ffi::luaL_newstate());
@@ -192,7 +212,7 @@ async fn async_main() -> Result<()> {
             if ffi::LUA_OK
                 != ffi::luaL_loadstring(
                     lua_state.as_ptr(),
-                    CString::new(contents.as_str())?.as_ptr(),
+                    CString::new(contents)?.as_ptr(),
                 )
             {
                 return Err(Error::Custom(format!(
@@ -300,6 +320,13 @@ async fn async_main() -> Result<()> {
         .to_string_lossy()
         .as_ref()
         .to_string();
+    if is_rua {
+        let module = bootstrap_path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| Error::Custom("Rua bootstrap has no UTF-8 module name".to_string()))?;
+        bootstrap = format!("rua://{module}");
+    }
 
     CONTEXT.set_env("ARG", arg.as_bytes());
 

@@ -7,6 +7,7 @@ resolver = "2"
 members = [
     "crates/moon-base",
     "crates/moon-runtime",
+    "crates/moon-rua",
     "crates/moon-app",
     "crates/moon-game",
     "xtask",
@@ -18,6 +19,9 @@ exclude = [
 [workspace.dependencies]
 moon-runtime = { path = "crates/moon-runtime" }
 moon-base = { path = "crates/moon-base", features = ["lua55"] }
+moon-rua = { path = "crates/moon-rua" }
+ruac = { path = "../rua/crates/ruac" }
+rua-resources = { path = "../rua/crates/rua-resources" }
 
 mimalloc = "0.1.39"
 tokio = { version = "1", features = ["full"] }

@@ -10,6 +10,7 @@ use moon_runtime::{
     actor::LuaActor,
     check_buffer,
     context::{self, CONTEXT, LOGGER, LuaActorParam, Message, MessageBody, Watchdog},
+    loader::{LuaErrorContext, LuaErrorPhase, install_module_searcher, load_chunk},
     log::Logger,
 };
 use tokio::sync::mpsc;
@@ -57,8 +58,22 @@ extern "C-unwind" fn lua_actor_protect_init(state: LuaState) -> c_int {
 
         luaopen_custom_libs(state);
 
-        let source = CString::new((*param).source.as_str()).unwrap();
-        if ffi::luaL_loadfile(state.as_ptr(), source.as_ptr()) != ffi::LUA_OK {
+        let loader = CONTEXT.module_loader();
+        if let Some(loader) = loader.as_ref() {
+            if let Err(error) = install_module_searcher(state, loader.clone()) {
+                laux::lua_error(state, format!("install Rua module loader failed: {error}"));
+            }
+        }
+
+        let load_status = loader
+            .as_ref()
+            .and_then(|loader| loader.load_entry((*param).source.as_str()))
+            .map(|chunk| load_chunk(state, &chunk))
+            .unwrap_or_else(|| {
+                let source = CString::new((*param).source.as_str()).unwrap();
+                ffi::luaL_loadfile(state.as_ptr(), source.as_ptr())
+            });
+        if load_status != ffi::LUA_OK {
             return 1;
         }
 
@@ -324,10 +339,17 @@ pub fn init(
         if ffi::lua_pcall(main_state, 1, ffi::LUA_MULTRET, trace_fn) != ffi::LUA_OK
             || ffi::lua_gettop(main_state) != 1
         {
-            return Err(format!(
-                "init actor failed: {}",
-                laux::lua_opt_str(state, -1).unwrap_or("no error message")
-            ));
+            let raw = laux::lua_opt_str(state, -1)
+                .unwrap_or("no error message")
+                .to_string();
+            let context = LuaErrorContext {
+                actor_id: params.id,
+                actor_name: params.name.clone(),
+                source: params.source.clone(),
+                phase: LuaErrorPhase::Init,
+            };
+            let formatted = CONTEXT.format_lua_error(&context, &raw);
+            return Err(format!("init actor failed: {formatted}"));
         }
 
         ffi::lua_pop(main_state, 1);
@@ -365,34 +387,25 @@ fn handle(actor: &mut LuaActor, m: &mut Message) {
             return;
         }
 
-        let err = match r {
-            ffi::LUA_ERRRUN => {
-                format!(
-                    "actor '{}' dispatch message error:\n{}",
-                    actor.name,
-                    laux::lua_opt_str(LuaState::new(callback_state).unwrap(), -1)
-                        .unwrap_or("no error message")
-                )
-            }
-            ffi::LUA_ERRMEM => {
-                format!(
-                    "actor '{}' dispatch message error:\n{}",
-                    actor.name, "memory error"
-                )
-            }
-            ffi::LUA_ERRERR => {
-                format!(
-                    "actor '{}' dispatch message error:\n{}",
-                    actor.name, "error in error"
-                )
-            }
-            _ => {
-                format!(
-                    "actor '{}' dispatch message error:\n{}",
-                    actor.name, "unknown error"
-                )
-            }
+        let raw = match r {
+            ffi::LUA_ERRRUN => laux::lua_opt_str(LuaState::new(callback_state).unwrap(), -1)
+                .unwrap_or("no error message")
+                .to_string(),
+            ffi::LUA_ERRMEM => "memory error".to_string(),
+            ffi::LUA_ERRERR => "error in error".to_string(),
+            _ => "unknown error".to_string(),
         };
+        let context = LuaErrorContext {
+            actor_id: actor.id,
+            actor_name: actor.name.clone(),
+            source: actor.source.clone(),
+            phase: LuaErrorPhase::Dispatch,
+        };
+        let formatted = CONTEXT.format_lua_error(&context, &raw);
+        let err = format!(
+            "actor '{}' dispatch message error:\n{}",
+            actor.name, formatted
+        );
 
         laux::lua_pop(LuaState::new(callback_state).unwrap(), 1);
 
