@@ -43,6 +43,7 @@ flowchart LR
 | --- | --- |
 | `crates/moon-app` | binary entry point, bootstrap, signal handling |
 | `crates/moon-runtime` | actor runtime (context, messages, timer, logger) + all Rust→Lua native bindings |
+| `crates/moon-rua` | Rua compilation, precompiled artifact loader, custom Lua loader, and Rua traceback rendering |
 | `crates/moon-base` | foundation: embedded Lua 5.5 sources, Rust FFI, helper macros, shared Buffer |
 | `lualib/` | user-facing Lua APIs and wrappers |
 | `assets/` | examples, benchmarks, integration-style test scripts |
@@ -56,6 +57,29 @@ flowchart LR
 cargo build --release
 cargo run --release -- assets/example/example.lua
 ```
+
+Rua source can be started directly. `moon_rs` compiles the source in-process,
+loads the root and modules through a Lua custom loader, and maps runtime errors
+back to Rua source ranges:
+
+```bash
+cargo run --release -- path/to/main.rua arg1 arg2
+```
+
+Precompiled Rua artifacts can run without compiling Rua at startup. Build them
+with `ruac build` and pass the generated Lua entry to Moon:
+
+```bash
+ruac build path/to/main.rua --emit modules --out-dir dist/modules
+cargo run --release -- dist/modules/main.lua arg1 arg2
+```
+
+Moon discovers `rua-artifact.json` or `<entry>.rua-map.json`, validates the
+artifact hash and ABI, and installs the same in-memory module loader and Rua
+stack formatter. Plain Lua files without artifact metadata keep the normal
+filesystem loader.
+
+Existing `.lua` bootstrap files continue to use the filesystem loader.
 
 Useful entry points:
 

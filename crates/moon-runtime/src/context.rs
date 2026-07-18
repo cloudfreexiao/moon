@@ -5,7 +5,7 @@ use std::{
     collections::BTreeSet,
     ffi::c_void,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{
             AtomicI32, AtomicI64, AtomicIsize, AtomicPtr, AtomicU8, AtomicU32, AtomicU64,
             AtomicUsize, Ordering,
@@ -17,6 +17,7 @@ use std::{
 use tokio::{runtime::Builder, sync::mpsc, time::timeout};
 
 use crate::escape_print;
+use crate::loader::{LuaErrorContext, LuaErrorReporter, LuaModuleLoader};
 
 use super::{actor::LuaActor, buffer::Buffer, log::Logger};
 
@@ -80,6 +81,8 @@ lazy_static! {
             io_runtime,
             main_handle: std::sync::OnceLock::new(),
             unique_threads: Mutex::new(Vec::new()),
+            module_loader: RwLock::new(None),
+            error_reporter: RwLock::new(None),
         }
     };
     pub static ref LOGGER: Logger = Logger::new();
@@ -349,6 +352,8 @@ pub struct LuaActorServer {
     /// is still running its per-thread allocator cleanup (`_mi_thread_done`),
     /// corrupting mimalloc's global heap state and segfaulting.
     unique_threads: Mutex<Vec<thread::JoinHandle<()>>>,
+    module_loader: RwLock<Option<Arc<dyn LuaModuleLoader>>>,
+    error_reporter: RwLock<Option<Arc<dyn LuaErrorReporter>>>,
 }
 
 impl LuaActorServer {
@@ -453,6 +458,37 @@ impl LuaActorServer {
     pub fn set_env(&self, key: &str, value: &[u8]) {
         self.env
             .insert(key.to_string(), Arc::new(value.to_vec()));
+    }
+
+    pub fn set_module_loader(&self, loader: Arc<dyn LuaModuleLoader>) {
+        if let Ok(mut slot) = self.module_loader.write() {
+            *slot = Some(loader);
+        }
+    }
+
+    pub fn module_loader(&self) -> Option<Arc<dyn LuaModuleLoader>> {
+        self.module_loader
+            .read()
+            .ok()
+            .and_then(|loader| loader.clone())
+    }
+
+    pub fn set_error_reporter(&self, reporter: Arc<dyn LuaErrorReporter>) {
+        if let Ok(mut slot) = self.error_reporter.write() {
+            *slot = Some(reporter);
+        }
+    }
+
+    pub fn format_lua_error(&self, context: &LuaErrorContext, raw: &str) -> String {
+        self.error_reporter
+            .read()
+            .ok()
+            .and_then(|reporter| {
+                reporter
+                    .as_ref()
+                    .map(|reporter| reporter.format_error(context, raw))
+            })
+            .unwrap_or_else(|| raw.to_string())
     }
 
     pub fn get_env(&self, key: &str) -> Option<Arc<Vec<u8>>> {
