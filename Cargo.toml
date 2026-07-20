@@ -20,8 +20,8 @@ exclude = [
 moon-runtime = { path = "crates/moon-runtime" }
 moon-base = { path = "crates/moon-base", features = ["lua55"] }
 moon-rua = { path = "crates/moon-rua" }
-ruac = { path = "../rua/crates/ruac" }
-rua-resources = { path = "../rua/crates/rua-resources" }
+ruac = { git = "https://github.com/sniper00/rua-lang" }
+rua-resources = { git = "https://github.com/sniper00/rua-lang" }
 
 mimalloc = "0.1.39"
 tokio = { version = "1", features = ["full"] }
