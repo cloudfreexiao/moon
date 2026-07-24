@@ -2890,18 +2890,21 @@ dependencies = [
 
 [[package]]
 name = "rua-core"
-version = "0.1.0"
+version = "0.1.1"
+source = "git+https://github.com/sniper00/rua-lang#e5f6ce731eeb934676646d2eec5e75ef621305ec"
 
 [[package]]
 name = "rua-lex"
-version = "0.1.0"
+version = "0.1.1"
+source = "git+https://github.com/sniper00/rua-lang#e5f6ce731eeb934676646d2eec5e75ef621305ec"
 dependencies = [
  "rua-core",
 ]
 
 [[package]]
 name = "rua-project"
-version = "0.1.0"
+version = "0.1.1"
+source = "git+https://github.com/sniper00/rua-lang#e5f6ce731eeb934676646d2eec5e75ef621305ec"
 dependencies = [
  "rua-core",
  "serde",
@@ -2910,7 +2913,8 @@ dependencies = [
 
 [[package]]
 name = "rua-resources"
-version = "0.1.0"
+version = "0.1.1"
+source = "git+https://github.com/sniper00/rua-lang#e5f6ce731eeb934676646d2eec5e75ef621305ec"
 dependencies = [
  "include_dir",
  "serde",
@@ -2919,7 +2923,8 @@ dependencies = [
 
 [[package]]
 name = "ruac"
-version = "0.1.0"
+version = "0.1.1"
+source = "git+https://github.com/sniper00/rua-lang#e5f6ce731eeb934676646d2eec5e75ef621305ec"
 dependencies = [
  "rua-core",
  "rua-lex",

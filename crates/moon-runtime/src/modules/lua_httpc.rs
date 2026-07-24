@@ -3,8 +3,8 @@ use lazy_static::lazy_static;
 use moon_base::{
     self, cstr,
     ffi::{self},
-    laux::{self, LuaState, LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib,
+    laux::{self, LuaStack, LuaState, LuaTable},
+    lreg_null, lreg_try, luaL_newlib,
 };
 use moon_runtime::{
     actor::LuaActor,
@@ -142,48 +142,42 @@ async fn http_request(req: HttpRequest) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn extract_headers(state: LuaState, index: i32) -> Result<HeaderMap, String> {
+fn extract_headers(lua: &mut LuaStack<'_>, index: i32) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::with_capacity(8); // Pre-allocate reasonable size
 
-    let table = LuaTable::from_stack(state, index);
-    let header_table = table.rawget("headers");
+    let Some(cursor) = lua.table_field_cursor(index, "headers") else {
+        return Ok(headers);
+    };
+    for entry in cursor {
+        let key = entry.key();
+        let value = entry.value();
+        let key_str = key.to_string();
+        let value_str = value.to_string();
 
-    match &header_table.value {
-        LuaValue::Table(header_table) => {
-            header_table
-                .iter()
-                .try_for_each(|(key, value)| {
-                    let key_str = key.to_string();
-                    let value_str = value.to_string();
+        // Parse header name and value
+        let name = key_str
+            .parse::<reqwest::header::HeaderName>()
+            .map_err(|e| format!("Invalid header name '{}': {}", key_str, e))?;
 
-                    // Parse header name and value
-                    let name = key_str
-                        .parse::<reqwest::header::HeaderName>()
-                        .map_err(|e| format!("Invalid header name '{}': {}", key_str, e))?;
+        let value = value_str
+            .parse::<reqwest::header::HeaderValue>()
+            .map_err(|e| format!("Invalid header value '{}': {}", value_str, e))?;
 
-                    let value = value_str
-                        .parse::<reqwest::header::HeaderValue>()
-                        .map_err(|e| format!("Invalid header value '{}': {}", value_str, e))?;
-
-                    headers.insert(name, value);
-                    Ok(())
-                })
-                .map_err(|e: String| e)?;
-        }
-        _ => return Ok(headers), // Empty headers if not a table
+        headers.insert(name, value);
     }
 
     Ok(headers)
 }
 
-extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
-    laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
+fn lua_http_request(lua: &mut LuaStack<'_>) -> Result<i32, String> {
+    let state = lua.state();
+    if lua.value(1).kind() != laux::LuaType::Table {
+        return Err("bad argument #1 (table expected)".to_string());
+    }
 
-    let headers = match extract_headers(state, 1) {
+    let headers = match extract_headers(lua, 1) {
         Ok(headers) => headers,
-        Err(err) => {
-            return crate::lua_push_error(state, &err);
-        }
+        Err(error) => return Ok(crate::lua_push_error_tuple(state, &error)),
     };
 
     let actor = LuaActor::from_lua_state(state);
@@ -194,30 +188,30 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
     // Read the (optional) request body as raw bytes so binary payloads are
     // preserved, and cap it so a single request can't buffer an unbounded
     // amount of memory before it is even sent.
-    let body: Vec<u8> = match laux::opt_field::<&[u8]>(state, 1, "body") {
+    let body: Vec<u8> = match lua.opt_field::<Vec<u8>>(1, "body") {
         Some(b) if b.len() > crate::LIMITS.max_network_read_bytes => {
-            return crate::lua_push_error(
+            return Ok(crate::lua_push_error_tuple(
                 state,
                 &format!(
                     "http request body too large: {} bytes (max {})",
                     b.len(),
                     crate::LIMITS.max_network_read_bytes
                 ),
-            );
+            ));
         }
-        Some(b) => b.to_vec(),
+        Some(b) => b,
         None => Vec::new(),
     };
 
     let req = HttpRequest {
         id,
         session,
-        method: laux::opt_field(state, 1, "method").unwrap_or("GET".to_string()),
-        url: laux::opt_field(state, 1, "url").unwrap_or_default(),
+        method: lua.opt_field(1, "method").unwrap_or("GET".to_string()),
+        url: lua.opt_field(1, "url").unwrap_or_default(),
         body,
         headers,
-        timeout: laux::opt_field(state, 1, "timeout").unwrap_or(5000),
-        proxy: laux::opt_field(state, 1, "proxy").unwrap_or_default(),
+        timeout: lua.opt_field(1, "timeout").unwrap_or(5000),
+        proxy: lua.opt_field(1, "proxy").unwrap_or_default(),
     };
 
     CONTEXT.io_runtime().spawn(async move {
@@ -236,8 +230,8 @@ extern "C-unwind" fn lua_http_request(state: LuaState) -> i32 {
         }
     });
 
-    laux::lua_push(state, session);
-    1
+    lua.push(session);
+    Ok(1)
 }
 
 fn push_http_response(state: LuaState, response: HttpResponse) -> i32 {
@@ -254,53 +248,74 @@ fn push_http_response(state: LuaState, response: HttpResponse) -> i32 {
     1
 }
 
-extern "C-unwind" fn lua_http_form_urlencode(state: LuaState) -> i32 {
-    laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
+fn lua_http_form_urlencode(lua: &mut LuaStack<'_>) -> Result<i32, String> {
+    if lua.value(1).kind() != laux::LuaType::Table {
+        return Err("bad argument #1 (table expected)".to_string());
+    }
 
     let mut result = String::with_capacity(64);
-    for (key, value) in LuaTable::from_stack(state, 1).iter() {
-        if !result.is_empty() {
-            result.push('&');
+    {
+        for entry in lua.table_cursor(1) {
+            let key = entry.key();
+            let value = entry.value();
+            if !result.is_empty() {
+                result.push('&');
+            }
+            let encoded_key = match key.as_bytes() {
+                Some(bytes) => form_urlencoded::byte_serialize(bytes).collect::<String>(),
+                None => {
+                    let text = key.to_string();
+                    form_urlencoded::byte_serialize(text.as_bytes()).collect::<String>()
+                }
+            };
+            result.push_str(&encoded_key);
+            result.push('=');
+            let encoded_value = match value.as_bytes() {
+                Some(bytes) => form_urlencoded::byte_serialize(bytes).collect::<String>(),
+                None => {
+                    let text = value.to_string();
+                    form_urlencoded::byte_serialize(text.as_bytes()).collect::<String>()
+                }
+            };
+            result.push_str(&encoded_value);
         }
-        result.push_str(
-            form_urlencoded::byte_serialize(key.to_vec().as_ref())
-                .collect::<String>()
-                .as_str(),
-        );
-        result.push('=');
-        result.push_str(
-            form_urlencoded::byte_serialize(value.to_vec().as_ref())
-                .collect::<String>()
-                .as_str(),
-        );
     }
-    laux::lua_push(state, result);
-    1
+    lua.push(result);
+    Ok(1)
 }
 
-extern "C-unwind" fn lua_http_form_urldecode(state: LuaState) -> i32 {
-    let query_string = unsafe { laux::lua_check_str(state, 1) };
+fn lua_http_form_urldecode(lua: &mut LuaStack<'_>) -> Result<i32, String> {
+    let query_string = lua
+        .value(1)
+        .as_str()
+        .ok_or_else(|| "bad argument #1 (valid UTF-8 string expected)".to_string())?;
 
     let decoded: Vec<(String, String)> = form_urlencoded::parse(query_string.as_bytes())
         .into_owned()
         .collect();
 
-    let table = LuaTable::new(state, 0, decoded.len());
+    let table = LuaTable::new(lua.state(), 0, decoded.len());
 
     for (key, value) in decoded {
         table.insert(key, value);
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn lua_http_parse_response(state: LuaState) -> c_int {
-    let raw_response = unsafe { laux::lua_check_lstring(state, 1) };
+fn lua_http_parse_response(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    // SAFETY: argument 1 remains rooted for the whole parser call. The parser
+    // only reads its bytes while the result tables append values above it; no
+    // operation pops, replaces, or reorders the source slot.
+    let raw_response = unsafe {
+        lua.value_bytes_append_only(1)
+            .ok_or_else(|| "bad argument #1 (string expected)".to_string())?
+    };
 
     let mut lines = raw_response.split(|&x| x == b'\n');
     let version_line = match lines.next() {
         Some(version_line) => version_line,
         None => {
-            return crate::lua_push_error(state, "No input");
+            return Ok(crate::lua_push_error_tuple(lua.state(), "No input"));
         }
     };
 
@@ -308,21 +323,24 @@ extern "C-unwind" fn lua_http_parse_response(state: LuaState) -> c_int {
     let version = match parts.next() {
         Some(part) if part.len() >= 5 => &part[5..],
         Some(_) => {
-            return crate::lua_push_error(state, "Invalid HTTP version");
+            return Ok(crate::lua_push_error_tuple(
+                lua.state(),
+                "Invalid HTTP version",
+            ));
         }
         None => {
-            return crate::lua_push_error(state, "No version");
+            return Ok(crate::lua_push_error_tuple(lua.state(), "No version"));
         }
     };
 
     let status_code = match parts.next() {
         Some(part) => part,
         None => {
-            return crate::lua_push_error(state, "No status code");
+            return Ok(crate::lua_push_error_tuple(lua.state(), "No status code"));
         }
     };
 
-    let response = LuaTable::new(state, 0, 6);
+    let response = LuaTable::new(lua.state(), 0, 6);
     response.insert("version", version);
     response.insert(
         "status_code",
@@ -330,7 +348,7 @@ extern "C-unwind" fn lua_http_parse_response(state: LuaState) -> c_int {
     );
 
     response.rawset_x("headers", || {
-        let headers = LuaTable::new(state, 0, 16);
+        let headers = LuaTable::new(lua.state(), 0, 16);
         for line in lines {
             let mut parts = line.splitn(2, |&x| x == b':');
             let key = match parts.next() {
@@ -346,11 +364,16 @@ extern "C-unwind" fn lua_http_parse_response(state: LuaState) -> c_int {
         }
     });
 
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn lua_http_parse_request(state: LuaState) -> c_int {
-    let raw_request = unsafe { laux::lua_check_lstring(state, 1) };
+fn lua_http_parse_request(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    // SAFETY: argument 1 remains rooted while httparse's borrowed fields are
+    // copied into the result table. All Lua operations only append above it.
+    let raw_request = unsafe {
+        lua.value_bytes_append_only(1)
+            .ok_or_else(|| "bad argument #1 (string expected)".to_string())?
+    };
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
 
@@ -368,20 +391,23 @@ extern "C-unwind" fn lua_http_parse_request(state: LuaState) -> c_int {
                 &path
             };
 
-            LuaTable::new(state, 0, 6)
+            LuaTable::new(lua.state(), 0, 6)
                 .insert("method", method)
                 .insert("path", path)
                 .insert("query_string", query_string)
                 .rawset_x("headers", || {
-                    let headers = LuaTable::new(state, 0, req.headers.len());
+                    let headers = LuaTable::new(lua.state(), 0, req.headers.len());
                     for header in req.headers.iter() {
                         headers.insert(header.name.to_lowercase(), header.value);
                     }
                 });
-            1
+            Ok(1)
         }
-        Ok(httparse::Status::Partial) => crate::lua_push_error(state, "Incomplete request"),
-        Err(err) => crate::lua_push_error(state, &err.to_string()),
+        Ok(httparse::Status::Partial) => Ok(crate::lua_push_error_tuple(
+            lua.state(),
+            "Incomplete request",
+        )),
+        Err(err) => Ok(crate::lua_push_error_tuple(lua.state(), &err.to_string())),
     }
 }
 
@@ -391,17 +417,17 @@ pub unsafe extern "C-unwind" fn decode_httpc_message(
 ) -> c_int {
     match unsafe { crate::message_decode::take_boxed::<HttpResponse>(m) } {
         Ok(response) => push_http_response(state, response),
-        Err(e) => crate::lua_push_error(state, &e),
+        Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
 
 pub extern "C-unwind" fn luaopen_httpc(state: LuaState) -> c_int {
     let l = [
-        lreg!("request", lua_http_request),
-        lreg!("form_urlencode", lua_http_form_urlencode),
-        lreg!("form_urldecode", lua_http_form_urldecode),
-        lreg!("parse_response", lua_http_parse_response),
-        lreg!("parse_request", lua_http_parse_request),
+        lreg_try!("request", lua_http_request),
+        lreg_try!("form_urlencode", lua_http_form_urlencode),
+        lreg_try!("form_urldecode", lua_http_form_urldecode),
+        lreg_try!("parse_response", lua_http_parse_response),
+        lreg_try!("parse_request", lua_http_parse_request),
         lreg_null!(),
     ];
 

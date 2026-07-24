@@ -33,7 +33,10 @@ pub const LUA_TABLIBK: c_int = LUA_GLIBK << 8;
 pub const LUA_UTF8LIBNAME: *const c_char = cstr!("utf8");
 pub const LUA_UTF8LIBK: c_int = LUA_GLIBK << 9;
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     pub fn luaopen_base(L: *mut lua_State) -> c_int;
     pub fn luaopen_package(L: *mut lua_State) -> c_int;
@@ -52,6 +55,8 @@ unsafe extern "C-unwind" {
     pub fn luaL_initcodecache();
 }
 
-pub unsafe fn luaL_openlibs(L: *mut lua_State) { unsafe {
-    luaL_openselectedlibs(L, !0, 0);
-}}
+pub unsafe fn luaL_openlibs(L: *mut lua_State) {
+    unsafe {
+        luaL_openselectedlibs(L, !0, 0);
+    }
+}

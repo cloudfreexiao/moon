@@ -1,4 +1,9 @@
-use moon_base::{cstr, ffi, laux::LuaState};
+use moon_base::laux;
+use moon_base::{
+    cstr, ffi,
+    laux::{LuaStack, LuaState},
+};
+use moon_base::{lreg, lreg_null};
 use moon_runtime::{
     actor::LuaActor,
     context::{CONTEXT, Watchdog},
@@ -195,7 +200,8 @@ unsafe fn timing_resume(l: *mut ffi::lua_State, co_index: c_int, narg: c_int) ->
 }
 
 /// `coroutine.resume(co, ...)` — switchL-aware, profiling-aware version.
-unsafe extern "C-unwind" fn lua_coroutine_resume(l: *mut ffi::lua_State) -> c_int {
+fn lua_coroutine_resume(lua: &mut LuaStack<'_>) -> c_int {
+    let l = lua.as_ptr();
     unsafe {
         ffi::luaL_checktype(l, 1, ffi::LUA_TTHREAD);
         let r = timing_resume(l, 1, ffi::lua_gettop(l) - 1);
@@ -239,7 +245,8 @@ unsafe extern "C-unwind" fn lua_coroutine_aux_wrap(l: *mut ffi::lua_State) -> c_
 
 /// `coroutine.wrap(f)` — creates a coroutine and returns an iterator closure.
 /// Upvalues 1 and 2 carry the shared profiling tables onto the closure.
-unsafe extern "C-unwind" fn lua_coroutine_wrap(l: *mut ffi::lua_State) -> c_int {
+fn lua_coroutine_wrap(lua: &mut LuaStack<'_>) -> c_int {
+    let l = lua.as_ptr();
     unsafe {
         ffi::lua_pushvalue(l, ffi::lua_upvalueindex(1));
         ffi::lua_pushvalue(l, ffi::lua_upvalueindex(2));
@@ -269,7 +276,8 @@ unsafe fn profile_target(l: *mut ffi::lua_State) {
 
 /// `coroutine.profile.start([co])` — begin profiling a coroutine (defaults to
 /// the running one), resetting its accumulated total time.
-unsafe extern "C-unwind" fn lua_profile_start(l: *mut ffi::lua_State) -> c_int {
+fn lua_profile_start(lua: &mut LuaStack<'_>) -> c_int {
+    let l = lua.as_ptr();
     unsafe {
         profile_target(l);
 
@@ -297,7 +305,8 @@ unsafe extern "C-unwind" fn lua_profile_start(l: *mut ffi::lua_State) -> c_int {
 
 /// `coroutine.profile.stop([co])` — stop profiling a coroutine and return its
 /// total accumulated run time in seconds.
-unsafe extern "C-unwind" fn lua_profile_stop(l: *mut ffi::lua_State) -> c_int {
+fn lua_profile_stop(lua: &mut LuaStack<'_>) -> c_int {
+    let l = lua.as_ptr();
     unsafe {
         profile_target(l);
 
@@ -339,26 +348,11 @@ pub extern "C-unwind" fn luaopen_coroutine_profile(state: LuaState) -> c_int {
         // The sentinel `func` is never invoked (luaL_setfuncs stops at the NULL
         // name); any valid pointer satisfies the non-nullable field type.
         let funcs = [
-            ffi::luaL_Reg {
-                name: cstr!("start"),
-                func: lua_profile_start,
-            },
-            ffi::luaL_Reg {
-                name: cstr!("stop"),
-                func: lua_profile_stop,
-            },
-            ffi::luaL_Reg {
-                name: cstr!("resume"),
-                func: lua_coroutine_resume,
-            },
-            ffi::luaL_Reg {
-                name: cstr!("wrap"),
-                func: lua_coroutine_wrap,
-            },
-            ffi::luaL_Reg {
-                name: std::ptr::null(),
-                func: lua_profile_start,
-            },
+            lreg!("start", lua_profile_start),
+            lreg!("stop", lua_profile_stop),
+            lreg!("resume", lua_coroutine_resume),
+            lreg!("wrap", lua_coroutine_wrap),
+            lreg_null!(),
         ];
 
         // module table (index 2; the module name passed by `require` is at index 1)
@@ -375,7 +369,7 @@ pub extern "C-unwind" fn luaopen_coroutine_profile(state: LuaState) -> c_int {
         ffi::lua_setmetatable(l, -3); // total-time table
         ffi::lua_setmetatable(l, -3); // start-time table
 
-        ffi::luaL_setfuncs(l, funcs.as_ptr(), 2);
+        ffi::luaL_setfuncs(l, funcs.as_ptr() as *const ffi::luaL_Reg, 2);
 
         // patch the global `coroutine` table to use our resume/wrap
         ffi::lua_getglobal(l, cstr!("coroutine"));

@@ -19,16 +19,16 @@
 //!   true` in the definition. For compatibility with Moon's generators, a proto
 //!   whose name begins with `array_`/`map_` is also treated as a wrapper even
 //!   without the explicit flag.
-//! - **Errors propagate as `Result`** and surface through a single
-//!   `laux::lua_error` at the FFI boundary (no exceptions across C frames).
+//! - **Errors propagate as `Result`** and surface through the shared registration
+//!   wrapper at the FFI boundary (no exceptions across C frames).
 //! - **The trace allocates lazily**: array indices are cheap [`Seg::Index`] and
 //!   the path is only joined into a string when an error is actually produced.
 //! - **The global schema uses an `AtomicPtr` swap** (mirroring `lua_protobuf`),
 //!   so `load` may be called multiple times and readers on other actor threads
 //!   keep a valid `&'static` view (the previous schema is intentionally leaked).
 
-use moon_base::laux::{LuaState, LuaTable, LuaValue};
-use moon_base::{cstr, ffi, laux, lreg, lreg_null, luaL_newlib};
+use moon_base::laux::{LuaStack, LuaStackValue, LuaState};
+use moon_base::{cstr, ffi, laux, lreg_null, lreg_try, luaL_newlib};
 use std::collections::HashMap;
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -78,20 +78,33 @@ impl Prim {
 
     /// Whether a concrete Lua value satisfies this primitive, including the
     /// integer range/sign checks that the C++ original omits.
-    fn accepts(self, v: &LuaValue) -> bool {
+    fn accepts_stack(self, value: LuaStackValue<'_, '_>) -> bool {
+        let kind = value.kind();
         match self {
-            Prim::Int32 => {
-                matches!(v, LuaValue::Integer(n) if *n >= i32::MIN as i64 && *n <= i32::MAX as i64)
-            }
-            Prim::Uint32 => matches!(v, LuaValue::Integer(n) if *n >= 0 && *n <= u32::MAX as i64),
-            Prim::Int64 => matches!(v, LuaValue::Integer(_)),
-            // A Lua integer is an `i64`, so the only meaningful uint64 check is
-            // non-negativity; the upper bound is `i64::MAX` by construction.
-            Prim::Uint64 => matches!(v, LuaValue::Integer(n) if *n >= 0),
-            // Lua treats integers as numbers too, so accept both.
-            Prim::Float => matches!(v, LuaValue::Number(_) | LuaValue::Integer(_)),
-            Prim::Bool => matches!(v, LuaValue::Boolean(_)),
-            Prim::Str => matches!(v, LuaValue::String(_)),
+            Prim::Int32 => value
+                .as_integer()
+                .is_some_and(|n| n >= i32::MIN as i64 && n <= i32::MAX as i64),
+            Prim::Uint32 => value
+                .as_integer()
+                .is_some_and(|n| n >= 0 && n <= u32::MAX as i64),
+            Prim::Int64 => kind == laux::LuaType::Integer,
+            Prim::Uint64 => value.as_integer().is_some_and(|n| n >= 0),
+            Prim::Float => matches!(kind, laux::LuaType::Number | laux::LuaType::Integer),
+            Prim::Bool => kind == laux::LuaType::Boolean,
+            Prim::Str => kind == laux::LuaType::String,
+        }
+    }
+
+    #[cfg(test)]
+    fn accepts_kind(self, kind: laux::LuaType, integer: Option<i64>) -> bool {
+        match self {
+            Prim::Int32 => integer.is_some_and(|n| n >= i32::MIN as i64 && n <= i32::MAX as i64),
+            Prim::Uint32 => integer.is_some_and(|n| n >= 0 && n <= u32::MAX as i64),
+            Prim::Int64 => kind == laux::LuaType::Integer,
+            Prim::Uint64 => integer.is_some_and(|n| n >= 0),
+            Prim::Float => matches!(kind, laux::LuaType::Number | laux::LuaType::Integer),
+            Prim::Bool => kind == laux::LuaType::Boolean,
+            Prim::Str => kind == laux::LuaType::String,
         }
     }
 }
@@ -161,17 +174,113 @@ fn set_schema(s: Box<Schema>) {
 // ---------------------------------------------------------------------------
 
 /// Reads an optional string field option from a field-definition table.
-fn opt_str(def: &LuaTable, key: &str) -> Result<Option<String>, String> {
-    let sv = def.rawget(key);
-    match &sv.value {
-        LuaValue::Nil => Ok(None),
-        LuaValue::String(s) => Ok(Some(String::from_utf8_lossy(s).into_owned())),
-        other => Err(format!(
+fn opt_str(lua: &mut LuaStack<'_>, index: i32, key: &str) -> Result<Option<String>, String> {
+    let top = lua.top();
+    lua.push(key);
+    unsafe { ffi::lua_rawget(lua.as_ptr(), lua.abs_index(index)) };
+    let value = lua.value(-1);
+    let result = match value.kind() {
+        laux::LuaType::Nil => Ok(None),
+        laux::LuaType::String => Ok(value.as_string_lossy().map(|value| value.into_owned())),
+        _ => Err(format!(
             "schema.load: option '{}' must be a string, got {}",
             key,
-            other.name()
+            value.name()
         )),
+    };
+    lua.set_top(top);
+    result
+}
+
+fn opt_bool(lua: &mut LuaStack<'_>, index: i32, key: &str) -> Result<Option<bool>, String> {
+    let top = lua.top();
+    lua.push(key);
+    unsafe { ffi::lua_rawget(lua.as_ptr(), lua.abs_index(index)) };
+    let value = lua.value(-1);
+    let result = match value.kind() {
+        laux::LuaType::Nil => Ok(None),
+        laux::LuaType::Boolean => Ok(value.as_bool()),
+        _ => Err(format!(
+            "schema.load: option '{}' must be a boolean, got {}",
+            key,
+            value.name()
+        )),
+    };
+    lua.set_top(top);
+    result
+}
+
+fn build_raw_proto(
+    lua: &mut LuaStack<'_>,
+    proto_name: String,
+    def_index: i32,
+) -> Result<RawProto, String> {
+    let explicit_wrapper = opt_bool(lua, def_index, "wrapper")?.unwrap_or(false);
+    let wrapper =
+        explicit_wrapper || proto_name.starts_with("array_") || proto_name.starts_with("map_");
+
+    let mut fields = Vec::new();
+    for mut entry in lua.table_cursor(def_index) {
+        let field_name = {
+            let field_key = entry.key();
+            match field_key.kind() {
+                laux::LuaType::String => field_key
+                    .as_string_lossy()
+                    .map(|value| value.into_owned())
+                    .unwrap_or_default(),
+                _ => {
+                    return Err(format!(
+                        "schema.load: proto '{}' has a non-string field name",
+                        proto_name
+                    ));
+                }
+            }
+        };
+        if field_name == "wrapper" {
+            continue;
+        }
+        let field_index = {
+            let field_value = entry.value();
+            if field_value.kind() != laux::LuaType::Table {
+                return Err(format!(
+                    "schema.load: field '{}.{}' must be a table, got {}",
+                    proto_name,
+                    field_name,
+                    field_value.name()
+                ));
+            }
+            field_value.index()
+        };
+        let (container, key_type, value_type) = unsafe {
+            let lua = entry.lua_mut();
+            let container = match opt_str(lua, field_index, "container")?.as_deref() {
+                Some("array") => RawContainer::Array,
+                Some("object") => RawContainer::Object,
+                None | Some("") => RawContainer::Scalar,
+                Some(other) => {
+                    return Err(format!(
+                        "schema.load: field '{}.{}' has unknown container '{}'",
+                        proto_name, field_name, other
+                    ));
+                }
+            };
+            let key_type = opt_str(lua, field_index, "key_type")?;
+            let value_type = opt_str(lua, field_index, "value_type")?;
+            (container, key_type, value_type)
+        };
+        fields.push(RawField {
+            name: field_name,
+            container,
+            key_type,
+            value_type,
+        });
     }
+
+    Ok(RawProto {
+        name: proto_name,
+        wrapper,
+        fields,
+    })
 }
 
 /// Intermediate (pre-resolution) representation captured from Lua.
@@ -197,101 +306,32 @@ struct RawProto {
 /// Drains the Lua definition table into owned `RawProto`s, then resolves type
 /// references into a compiled [`Schema`]. Any malformed definition or unknown
 /// type reference is reported here (fail fast at load).
-fn build_schema(state: LuaState) -> Result<Schema, String> {
-    let outer = LuaTable::from_stack(state, 1);
+fn build_schema(lua: &mut LuaStack<'_>) -> Result<Schema, String> {
     let mut raws: Vec<RawProto> = Vec::new();
 
-    for (k, v) in outer.iter() {
-        let proto_name = match &k {
-            LuaValue::String(s) => String::from_utf8_lossy(s).into_owned(),
-            _ => return Err("schema.load: proto name must be a string".to_string()),
+    for mut entry in lua.table_cursor(1) {
+        let proto_name = {
+            let key = entry.key();
+            match key.kind() {
+                laux::LuaType::String => key
+                    .as_string_lossy()
+                    .map(|value| value.into_owned())
+                    .unwrap_or_default(),
+                _ => return Err("schema.load: proto name must be a string".to_string()),
+            }
         };
-        let def = match v {
-            LuaValue::Table(t) => t,
-            other => {
+        let def_index = {
+            let value = entry.value();
+            if value.kind() != laux::LuaType::Table {
                 return Err(format!(
                     "schema.load: proto '{}' definition must be a table, got {}",
                     proto_name,
-                    other.name()
+                    value.name()
                 ));
             }
+            value.index()
         };
-
-        let explicit_wrapper = match def.rawget("wrapper").value {
-            LuaValue::Boolean(b) => b,
-            LuaValue::Nil => false,
-            ref other => {
-                return Err(format!(
-                    "schema.load: proto '{}' field 'wrapper' must be a boolean, got {}",
-                    proto_name,
-                    other.name()
-                ));
-            }
-        };
-        // Backward compatibility with Moon's original schema convention: a proto
-        // whose name begins with `array_`/`map_` is a wrapper (its single `data`
-        // field holds the real container). Generators such as `proto.json` rely
-        // on this prefix and never emit an explicit `wrapper = true`, so without
-        // this fallback their `array_*`/`map_*` protos would be validated as
-        // ordinary protos and reject their integer/sequence keys.
-        let wrapper = explicit_wrapper
-            || proto_name.starts_with("array_")
-            || proto_name.starts_with("map_");
-
-        let mut fields = Vec::new();
-        for (fk, fv) in def.iter() {
-            let field_name = match &fk {
-                LuaValue::String(s) => String::from_utf8_lossy(s).into_owned(),
-                _ => {
-                    return Err(format!(
-                        "schema.load: proto '{}' has a non-string field name",
-                        proto_name
-                    ));
-                }
-            };
-            // `wrapper` is reserved configuration, not a field.
-            if field_name == "wrapper" {
-                continue;
-            }
-            let ftbl = match fv {
-                LuaValue::Table(t) => t,
-                other => {
-                    return Err(format!(
-                        "schema.load: field '{}.{}' must be a table, got {}",
-                        proto_name,
-                        field_name,
-                        other.name()
-                    ));
-                }
-            };
-
-            let container = match opt_str(&ftbl, "container")?.as_deref() {
-                Some("array") => RawContainer::Array,
-                Some("object") => RawContainer::Object,
-                None | Some("") => RawContainer::Scalar,
-                Some(other) => {
-                    return Err(format!(
-                        "schema.load: field '{}.{}' has unknown container '{}'",
-                        proto_name, field_name, other
-                    ));
-                }
-            };
-            let key_type = opt_str(&ftbl, "key_type")?;
-            let value_type = opt_str(&ftbl, "value_type")?;
-
-            fields.push(RawField {
-                name: field_name,
-                container,
-                key_type,
-                value_type,
-            });
-        }
-
-        raws.push(RawProto {
-            name: proto_name,
-            wrapper,
-            fields,
-        });
+        raws.push(unsafe { build_raw_proto(entry.lua_mut(), proto_name, def_index) }?);
     }
 
     // Pass 2: index proto names, then resolve every field's type.
@@ -396,7 +436,7 @@ fn join(trace: &[Seg]) -> String {
 }
 
 fn verify(
-    state: LuaState,
+    lua: &mut LuaStack<'_>,
     schema: &'static Schema,
     proto_idx: u32,
     index: i32,
@@ -410,12 +450,14 @@ fn verify(
             join(trace)
         ));
     }
-    laux::lua_checkstack(state, 8, cstr!("schema.verify"));
-    let index = laux::lua_absindex(state, index);
+    let state = lua.state();
+    laux::lua_checkstack(state, 8, cstr!("schema.verify"))?;
+    let index = lua.abs_index(index);
     let proto = &schema.protos[proto_idx as usize];
 
-    if laux::lua_type(state, index) != laux::LuaType::Table {
-        let got = LuaValue::from_stack(state, index).name();
+    let v = lua.value(index);
+    if v.kind() != laux::LuaType::Table {
+        let got = v.name();
         return Err(format!(
             "'{}' table expected, got {}. trace: {}",
             proto.name,
@@ -425,29 +467,53 @@ fn verify(
     }
 
     if proto.wrapper {
-        return verify_field(state, schema, proto, index, "data", trace, depth);
+        return verify_field(lua, schema, proto, index, "data", trace, depth);
     }
 
-    let t = LuaTable::from_stack(state, index);
-    for (k, _v) in t.iter() {
-        let key = match &k {
-            LuaValue::String(s) => std::str::from_utf8(s).unwrap_or(""),
-            _ => {
+    for mut entry in lua.table_cursor(index) {
+        let field = {
+            let key = entry.key();
+            if key.kind() != laux::LuaType::String {
                 return Err(format!(
                     "'{}' has a non-string key. trace: {}",
                     proto.name,
                     join(trace)
                 ));
             }
+            find_field(proto, key.as_str().unwrap_or(""), trace)?
         };
-        let vindex = laux::lua_absindex(state, -1);
-        verify_field(state, schema, proto, vindex, key, trace, depth)?;
+        if let (Container::Scalar, ValueType::Prim(prim)) = (field.container, field.value) {
+            trace.push(Seg::Field(&field.name));
+            let result = check_primitive(entry.value(), prim, trace);
+            trace.pop();
+            result?;
+            continue;
+        }
+        let value_index = entry.value().index();
+        unsafe {
+            verify_resolved_field(entry.lua_mut(), schema, value_index, field, trace, depth)
+        }?;
     }
     Ok(())
 }
 
+fn find_field(
+    proto: &'static Proto,
+    field_name: &str,
+    trace: &[Seg],
+) -> Result<&'static Field, String> {
+    proto.fields.get(field_name).ok_or_else(|| {
+        format!(
+            "attempt to index undefined field '{}.{}'. trace: {}",
+            proto.name,
+            field_name,
+            join(trace)
+        )
+    })
+}
+
 fn verify_field(
-    state: LuaState,
+    lua: &mut LuaStack<'_>,
     schema: &'static Schema,
     proto: &'static Proto,
     vindex: i32,
@@ -455,32 +521,30 @@ fn verify_field(
     trace: &mut Vec<Seg>,
     depth: u32,
 ) -> Result<(), String> {
-    let field = match proto.fields.get(field_name) {
-        Some(f) => f,
-        None => {
-            return Err(format!(
-                "attempt to index undefined field '{}.{}'. trace: {}",
-                proto.name,
-                field_name,
-                join(trace)
-            ));
-        }
-    };
+    let field = find_field(proto, field_name, trace)?;
+    verify_resolved_field(lua, schema, vindex, field, trace, depth)
+}
 
+fn verify_resolved_field(
+    lua: &mut LuaStack<'_>,
+    schema: &'static Schema,
+    vindex: i32,
+    field: &'static Field,
+    trace: &mut Vec<Seg>,
+    depth: u32,
+) -> Result<(), String> {
     trace.push(Seg::Field(&field.name));
     let r = match &field.container {
-        Container::Scalar => check_value(state, schema, vindex, field, trace, depth),
-        Container::Array => verify_array(state, schema, vindex, field, trace, depth),
-        Container::Object { key } => {
-            verify_object(state, schema, vindex, field, *key, trace, depth)
-        }
+        Container::Scalar => check_value(lua, schema, vindex, field, trace, depth),
+        Container::Array => verify_array(lua, schema, vindex, field, trace, depth),
+        Container::Object { key } => verify_object(lua, schema, vindex, field, *key, trace, depth),
     };
     trace.pop();
     r
 }
 
 fn check_value(
-    state: LuaState,
+    lua: &mut LuaStack<'_>,
     schema: &'static Schema,
     vindex: i32,
     field: &Field,
@@ -488,34 +552,41 @@ fn check_value(
     depth: u32,
 ) -> Result<(), String> {
     match &field.value {
-        ValueType::Prim(p) => {
-            let v = LuaValue::from_stack(state, vindex);
-            if p.accepts(&v) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} expected, got {}, value '{}'. trace: {}",
-                    p.name(),
-                    v.name(),
-                    v,
-                    join(trace)
-                ))
-            }
-        }
-        ValueType::Ref(idx) => verify(state, schema, *idx, vindex, trace, depth + 1),
+        ValueType::Prim(p) => check_primitive(lua.value(vindex), *p, trace),
+        ValueType::Ref(idx) => verify(lua, schema, *idx, vindex, trace, depth + 1),
+    }
+}
+
+fn check_primitive(
+    value: LuaStackValue<'_, '_>,
+    primitive: Prim,
+    trace: &[Seg],
+) -> Result<(), String> {
+    if primitive.accepts_stack(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} expected, got {}, value '{}'. trace: {}",
+            primitive.name(),
+            value.name(),
+            value,
+            join(trace)
+        ))
     }
 }
 
 fn verify_array(
-    state: LuaState,
+    lua: &mut LuaStack<'_>,
     schema: &'static Schema,
     vindex: i32,
     field: &Field,
     trace: &mut Vec<Seg>,
     depth: u32,
 ) -> Result<(), String> {
-    if laux::lua_type(state, vindex) != laux::LuaType::Table {
-        let got = LuaValue::from_stack(state, vindex).name();
+    let state = lua.state();
+    let v = lua.value(vindex);
+    if v.kind() != laux::LuaType::Table {
+        let got = v.name();
         return Err(format!(
             "array (table) expected, got {}. trace: {}",
             got,
@@ -523,12 +594,15 @@ fn verify_array(
         ));
     }
 
-    let t = LuaTable::from_stack(state, vindex);
-    let size = t.array_len();
+    let size = lua.array_len(vindex);
     if size == 0 {
         // `array_len` returns 0 for both an empty table and a non-sequence; only
         // the latter is an error, so disambiguate by checking for any key.
-        if t.iter().next().is_some() {
+        let has_key = {
+            let mut cursor = lua.table_cursor(vindex);
+            Iterator::next(&mut cursor).is_some()
+        };
+        if has_key {
             return Err(format!(
                 "not a valid array (sequence) table. trace: {}",
                 join(trace)
@@ -537,23 +611,34 @@ fn verify_array(
         return Ok(());
     }
 
-    laux::lua_checkstack(state, 4, cstr!("schema.array"));
-    for i in 1..=size {
-        unsafe {
-            ffi::lua_rawgeti(state.as_ptr(), vindex, i as ffi::lua_Integer);
-        }
+    laux::lua_checkstack(state, 4, cstr!("schema.array"))?;
+    let mut cursor = lua.array_cursor_len(vindex, size);
+    let mut i = 0;
+    while let Some(value) = cursor.next() {
+        i += 1;
         trace.push(Seg::Index(i));
-        let elem = laux::lua_absindex(state, -1);
-        let r = check_value(state, schema, elem, field, trace, depth);
+        let value_index = value.index();
+        let r = match field.value {
+            ValueType::Prim(primitive) => check_primitive(value, primitive, trace),
+            ValueType::Ref(proto_idx) => unsafe {
+                verify(
+                    cursor.lua_mut(),
+                    schema,
+                    proto_idx,
+                    value_index,
+                    trace,
+                    depth + 1,
+                )
+            },
+        };
         trace.pop();
-        laux::lua_pop(state, 1);
         r?;
     }
     Ok(())
 }
 
 fn verify_object(
-    state: LuaState,
+    lua: &mut LuaStack<'_>,
     schema: &'static Schema,
     vindex: i32,
     field: &Field,
@@ -561,8 +646,11 @@ fn verify_object(
     trace: &mut Vec<Seg>,
     depth: u32,
 ) -> Result<(), String> {
-    if laux::lua_type(state, vindex) != laux::LuaType::Table {
-        let got = LuaValue::from_stack(state, vindex).name();
+    let state = lua.state();
+    let vindex = lua.abs_index(vindex);
+    let v = lua.value(vindex);
+    if v.kind() != laux::LuaType::Table {
+        let got = v.name();
         return Err(format!(
             "object (table) expected, got {}. trace: {}",
             got,
@@ -570,37 +658,62 @@ fn verify_object(
         ));
     }
 
-    let t = LuaTable::from_stack(state, vindex);
-    laux::lua_checkstack(state, 6, cstr!("schema.object"));
-    for (k, _v) in t.iter() {
+    laux::lua_checkstack(state, 6, cstr!("schema.object"))?;
+    for mut entry in lua.table_cursor(vindex) {
         // An object whose first key is integer 1 is ambiguous with an array, so
         // it must opt in via the `__object` metafield (mirrors the C++ rule).
         // The let-chain short-circuits: `getmetafield` only runs for the single
         // entry whose key is integer 1 (if any), not once per entry, so a map
         // without that key pays nothing.
-        if let LuaValue::Integer(1) = k
-            && t.getmetafield(cstr!("__object")).is_none()
-        {
+        let (key_is_one, key_is_valid, key_name, key_string) = {
+            let key = entry.key();
+            (
+                key.as_integer() == Some(1),
+                key_prim.accepts_stack(key),
+                key.name(),
+                key.to_string(),
+            )
+        };
+        let has_object_meta = !key_is_one
+            || unsafe {
+                let top = ffi::lua_gettop(state.as_ptr());
+                let present = ffi::luaL_getmetafield(state.as_ptr(), vindex, cstr!("__object"))
+                    != ffi::LUA_TNIL;
+                ffi::lua_settop(state.as_ptr(), top);
+                present
+            };
+        if !has_object_meta {
             return Err(format!(
                 "object table uses integer key=1 but is missing metafield '__object'. trace: {}",
                 join(trace)
             ));
         }
 
-        let key_string = k.to_string();
         trace.push(Seg::Key(key_string));
-        if !key_prim.accepts(&k) {
+        if !key_is_valid {
             let msg = format!(
                 "$key {} expected, got {}. trace: {}",
                 key_prim.name(),
-                k.name(),
+                key_name,
                 join(trace)
             );
             trace.pop();
             return Err(msg);
         }
-        let vidx = laux::lua_absindex(state, -1);
-        let r = check_value(state, schema, vidx, field, trace, depth);
+        let r = match field.value {
+            ValueType::Prim(primitive) => check_primitive(entry.value(), primitive, trace),
+            ValueType::Ref(proto_idx) => unsafe {
+                let value_index = entry.value().index();
+                verify(
+                    entry.lua_mut(),
+                    schema,
+                    proto_idx,
+                    value_index,
+                    trace,
+                    depth + 1,
+                )
+            },
+        };
         trace.pop();
         r?;
     }
@@ -611,45 +724,53 @@ fn verify_object(
 // FFI entry points
 // ---------------------------------------------------------------------------
 
-extern "C-unwind" fn load(state: LuaState) -> c_int {
-    laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
-    match build_schema(state) {
+fn load(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    if lua.value(1).kind() != laux::LuaType::Table {
+        return Err("schema.load: table expected".to_string());
+    }
+    match build_schema(lua) {
         Ok(s) => {
             set_schema(Box::new(s));
-            0
         }
-        Err(e) => laux::lua_error(state, e),
+        Err(e) => return Err(e),
     }
+    Ok(0)
 }
 
-extern "C-unwind" fn validate(state: LuaState) -> c_int {
-    let proto_name = laux::lua_get::<&str>(state, 1);
-    laux::lua_checktype(state, 2, ffi::LUA_TTABLE);
+fn validate(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let proto_name = match lua.value(1).as_str() {
+        Some(name) => name,
+        None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
+    };
+    if lua.value(2).kind() != laux::LuaType::Table {
+        return Err("schema.validate: table expected".to_string());
+    }
 
     let schema = match schema() {
         Some(s) => s,
-        None => laux::lua_error(state, "schema.validate: no schema has been loaded".to_string()),
+        None => return Err("schema.validate: no schema has been loaded".to_string()),
     };
     let proto_idx = match schema.by_name.get(proto_name) {
         Some(&i) => i,
-        None => laux::lua_error(
-            state,
-            format!("schema.validate: attempt to use undefined proto '{proto_name}'"),
-        ),
+        None => {
+            return Err(format!(
+                "schema.validate: attempt to use undefined proto '{proto_name}'"
+            ));
+        }
     };
 
     let mut trace: Vec<Seg> = Vec::new();
     trace.push(Seg::Field(&schema.protos[proto_idx as usize].name));
-    match verify(state, schema, proto_idx, 2, &mut trace, 0) {
-        Ok(()) => 0,
-        Err(msg) => laux::lua_error(state, msg),
+    match verify(lua, schema, proto_idx, 2, &mut trace, 0) {
+        Ok(()) => Ok(0),
+        Err(msg) => Err(msg),
     }
 }
 
 pub extern "C-unwind" fn luaopen_schema(state: LuaState) -> c_int {
     let l = [
-        lreg!("load", load),
-        lreg!("validate", validate),
+        lreg_try!("load", load),
+        lreg_try!("validate", validate),
         lreg_null!(),
     ];
     luaL_newlib!(state, l);
@@ -673,35 +794,36 @@ mod tests {
 
     #[test]
     fn int_range_and_sign_checks() {
-        assert!(Prim::Int32.accepts(&LuaValue::Integer(i32::MAX as i64)));
-        assert!(!Prim::Int32.accepts(&LuaValue::Integer(i32::MAX as i64 + 1)));
-        assert!(!Prim::Int32.accepts(&LuaValue::Integer(i32::MIN as i64 - 1)));
+        let integer = laux::LuaType::Integer;
+        assert!(Prim::Int32.accepts_kind(integer, Some(i32::MAX as i64)));
+        assert!(!Prim::Int32.accepts_kind(integer, Some(i32::MAX as i64 + 1)));
+        assert!(!Prim::Int32.accepts_kind(integer, Some(i32::MIN as i64 - 1)));
 
-        assert!(Prim::Uint32.accepts(&LuaValue::Integer(u32::MAX as i64)));
-        assert!(!Prim::Uint32.accepts(&LuaValue::Integer(-1)));
-        assert!(!Prim::Uint32.accepts(&LuaValue::Integer(u32::MAX as i64 + 1)));
+        assert!(Prim::Uint32.accepts_kind(integer, Some(u32::MAX as i64)));
+        assert!(!Prim::Uint32.accepts_kind(integer, Some(-1)));
+        assert!(!Prim::Uint32.accepts_kind(integer, Some(u32::MAX as i64 + 1)));
 
-        assert!(Prim::Uint64.accepts(&LuaValue::Integer(i64::MAX)));
-        assert!(!Prim::Uint64.accepts(&LuaValue::Integer(-1)));
+        assert!(Prim::Uint64.accepts_kind(integer, Some(i64::MAX)));
+        assert!(!Prim::Uint64.accepts_kind(integer, Some(-1)));
 
-        assert!(Prim::Int64.accepts(&LuaValue::Integer(-1)));
+        assert!(Prim::Int64.accepts_kind(integer, Some(-1)));
     }
 
     #[test]
     fn non_integer_types() {
-        assert!(Prim::Bool.accepts(&LuaValue::Boolean(true)));
-        assert!(!Prim::Bool.accepts(&LuaValue::Integer(1)));
+        assert!(Prim::Bool.accepts_kind(laux::LuaType::Boolean, None));
+        assert!(!Prim::Bool.accepts_kind(laux::LuaType::Integer, Some(1)));
 
         // float accepts both floats and integers (Lua numbers).
-        assert!(Prim::Float.accepts(&LuaValue::Number(1.5)));
-        assert!(Prim::Float.accepts(&LuaValue::Integer(3)));
-        assert!(!Prim::Float.accepts(&LuaValue::String(b"x")));
+        assert!(Prim::Float.accepts_kind(laux::LuaType::Number, None));
+        assert!(Prim::Float.accepts_kind(laux::LuaType::Integer, Some(3)));
+        assert!(!Prim::Float.accepts_kind(laux::LuaType::String, None));
 
-        assert!(Prim::Str.accepts(&LuaValue::String(b"hi")));
-        assert!(!Prim::Str.accepts(&LuaValue::Integer(1)));
+        assert!(Prim::Str.accepts_kind(laux::LuaType::String, None));
+        assert!(!Prim::Str.accepts_kind(laux::LuaType::Integer, Some(1)));
 
         // integer types reject floats.
-        assert!(!Prim::Int32.accepts(&LuaValue::Number(1.5)));
+        assert!(!Prim::Int32.accepts_kind(laux::LuaType::Number, None));
     }
 
     #[test]

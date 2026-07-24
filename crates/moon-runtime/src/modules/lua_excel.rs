@@ -3,8 +3,8 @@ use csv::ReaderBuilder;
 use moon_base::{
     self, cstr,
     ffi::{self},
-    laux::{self, LuaNil, LuaState, LuaTable},
-    lreg, lreg_null, luaL_newlib,
+    laux::{self, LuaNil, LuaStack, LuaState, LuaTable},
+    lreg_null, lreg_try, luaL_newlib,
 };
 use std::path::Path;
 
@@ -38,7 +38,7 @@ fn read_csv(state: LuaState, path: &Path, max_row: usize) -> i32 {
                         for field in record.iter() {
                             row.push(field);
                         }
-                        sheet_data.push(row);
+                        sheet_data.push_table(row);
                     }
                     Err(err) => {
                         laux::lua_push(state, false);
@@ -53,7 +53,7 @@ fn read_csv(state: LuaState, path: &Path, max_row: usize) -> i32 {
             }
 
             one_sheet.insert_from_stack();
-            all_sheets.push(one_sheet);
+            all_sheets.push_table(one_sheet);
 
             1
         }
@@ -101,30 +101,42 @@ fn read_xlxs(state: LuaState, path: &Path, max_row: usize) -> i32 {
                                 _ => row_data.push(LuaNil {}),
                             };
                         }
-                        sheet_data.push(row_data);
+                        sheet_data.push_table(row_data);
                     }
                     one_sheet.insert_from_stack();
-                    all_sheets.push(one_sheet);
+                    all_sheets.push_table(one_sheet);
                 }
             }
             1
         }
-        Err(err) => crate::lua_push_error(state, &format!("{}", err)),
+        Err(err) => crate::lua_push_error_tuple(state, &format!("{}", err)),
     }
 }
 
-extern "C-unwind" fn lua_excel_read(state: LuaState) -> i32 {
-    let filename = unsafe { laux::lua_check_str(state, 1) };
-    let max_row: usize = laux::lua_opt(state, 2).unwrap_or(usize::MAX);
+fn lua_excel_read(lua: &mut LuaStack<'_>) -> Result<i32, String> {
+    let state = lua.state();
+    // SAFETY: argument #1 remains rooted while the synchronous reader appends
+    // result tables above it and never replaces or removes the source slot.
+    let filename = unsafe {
+        lua.value_bytes_append_only(1)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .ok_or_else(|| "bad argument #1 (valid UTF-8 string expected)".to_string())?
+    };
+    let max_row: usize = lua.opt(2).unwrap_or(usize::MAX);
+    // SAFETY: the source filename remains rooted at argument #1 while the
+    // synchronous reader only appends result tables above it.
     let path = Path::new(filename);
 
     match path.extension() {
         Some(ext) => {
             let ext = ext.to_string_lossy().to_string();
             match ext.as_str() {
-                "csv" => read_csv(state, path, max_row),
-                "xlsx" => read_xlxs(state, path, max_row),
-                _ => crate::lua_push_error(state, &format!("unsupport file type: {}", ext)),
+                "csv" => Ok(read_csv(state, path, max_row)),
+                "xlsx" => Ok(read_xlxs(state, path, max_row)),
+                _ => Ok(crate::lua_push_error_tuple(
+                    state,
+                    &format!("unsupport file type: {}", ext),
+                )),
             }
         }
         None => {
@@ -133,13 +145,13 @@ extern "C-unwind" fn lua_excel_read(state: LuaState) -> i32 {
                 state,
                 format!("unsupport file type: {}", path.to_string_lossy()),
             );
-            2
+            Ok(2)
         }
     }
 }
 
 pub extern "C-unwind" fn luaopen_excel(state: LuaState) -> i32 {
-    let l = [lreg!("read", lua_excel_read), lreg_null!()];
+    let l = [lreg_try!("read", lua_excel_read), lreg_null!()];
     luaL_newlib!(state, l);
     1
 }

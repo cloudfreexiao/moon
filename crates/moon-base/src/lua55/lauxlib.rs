@@ -20,7 +20,10 @@ pub struct luaL_Reg {
     pub func: lua_CFunction,
 }
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     pub fn luaL_checkversion_(L: *mut lua_State, ver: lua_Number, sz: usize);
 
@@ -29,8 +32,12 @@ unsafe extern "C-unwind" {
     pub fn luaL_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char;
     pub fn luaL_argerror(L: *mut lua_State, arg: c_int, extramsg: *const c_char) -> c_int;
     pub fn luaL_checklstring(L: *mut lua_State, arg: c_int, l: *mut usize) -> *const c_char;
-    pub fn luaL_optlstring(L: *mut lua_State, arg: c_int, def: *const c_char, l: *mut usize)
-    -> *const c_char;
+    pub fn luaL_optlstring(
+        L: *mut lua_State,
+        arg: c_int,
+        def: *const c_char,
+        l: *mut usize,
+    ) -> *const c_char;
     pub fn luaL_checknumber(L: *mut lua_State, arg: c_int) -> lua_Number;
     pub fn luaL_optnumber(L: *mut lua_State, arg: c_int, def: lua_Number) -> lua_Number;
     pub fn luaL_checkinteger(L: *mut lua_State, arg: c_int) -> lua_Integer;
@@ -57,27 +64,39 @@ unsafe extern "C-unwind" {
 
     pub fn luaL_fileresult(L: *mut lua_State, stat: c_int, fname: *const c_char) -> c_int;
     pub fn luaL_execresult(L: *mut lua_State, stat: c_int) -> c_int;
-    pub fn luaL_alloc(L: *mut lua_State, ptr: *mut c_void, osize: usize, nsize: usize) -> *mut c_void;
+    pub fn luaL_alloc(
+        L: *mut lua_State,
+        ptr: *mut c_void,
+        osize: usize,
+        nsize: usize,
+    ) -> *mut c_void;
 }
 
 // Pre-defined references
 pub const LUA_NOREF: c_int = -2;
 pub const LUA_REFNIL: c_int = -1;
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     pub fn luaL_ref(L: *mut lua_State, t: c_int) -> c_int;
     pub fn luaL_unref(L: *mut lua_State, t: c_int, r#ref: c_int);
 
-    pub fn luaL_loadfilex(L: *mut lua_State, filename: *const c_char, mode: *const c_char) -> c_int;
+    pub fn luaL_loadfilex(L: *mut lua_State, filename: *const c_char, mode: *const c_char)
+    -> c_int;
 }
 
 #[inline(always)]
-pub unsafe fn luaL_loadfile(L: *mut lua_State, f: *const c_char) -> c_int { unsafe {
-    luaL_loadfilex(L, f, ptr::null())
-}}
+pub unsafe fn luaL_loadfile(L: *mut lua_State, f: *const c_char) -> c_int {
+    unsafe { luaL_loadfilex(L, f, ptr::null()) }
+}
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     pub fn luaL_loadbufferx(
         L: *mut lua_State,
@@ -110,7 +129,12 @@ unsafe extern "C-unwind" {
 
     pub fn luaL_traceback(L: *mut lua_State, L1: *mut lua_State, msg: *const c_char, level: c_int);
 
-    pub fn luaL_requiref(L: *mut lua_State, modname: *const c_char, openf: lua_CFunction, glb: c_int);
+    pub fn luaL_requiref(
+        L: *mut lua_State,
+        modname: *const c_char,
+        openf: lua_CFunction,
+        glb: c_int,
+    );
 }
 
 //
@@ -120,56 +144,69 @@ unsafe extern "C-unwind" {
 // TODO: luaL_newlibtable, luaL_newlib
 
 #[inline(always)]
-pub unsafe fn luaL_argcheck(L: *mut lua_State, cond: c_int, arg: c_int, extramsg: *const c_char) { unsafe {
-    if cond == 0 {
-        luaL_argerror(L, arg, extramsg);
+pub unsafe fn luaL_argcheck(L: *mut lua_State, cond: c_int, arg: c_int, extramsg: *const c_char) {
+    unsafe {
+        if cond == 0 {
+            luaL_argerror(L, arg, extramsg);
+        }
     }
-}}
+}
 
 #[inline(always)]
-pub unsafe fn luaL_checkstring(L: *mut lua_State, n: c_int) -> *const c_char { unsafe {
-    luaL_checklstring(L, n, ptr::null_mut())
-}}
+pub unsafe fn luaL_checkstring(L: *mut lua_State, n: c_int) -> *const c_char {
+    unsafe { luaL_checklstring(L, n, ptr::null_mut()) }
+}
 
 #[inline(always)]
-pub unsafe fn luaL_optstring(L: *mut lua_State, n: c_int, d: *const c_char) -> *const c_char { unsafe {
-    luaL_optlstring(L, n, d, ptr::null_mut())
-}}
+pub unsafe fn luaL_optstring(L: *mut lua_State, n: c_int, d: *const c_char) -> *const c_char {
+    unsafe { luaL_optlstring(L, n, d, ptr::null_mut()) }
+}
 
 #[inline(always)]
-pub unsafe fn luaL_typename(L: *mut lua_State, i: c_int) -> *const c_char { unsafe {
-    lua::lua_typename(L, lua::lua_type(L, i))
-}}
+pub unsafe fn luaL_typename(L: *mut lua_State, i: c_int) -> *const c_char {
+    unsafe { lua::lua_typename(L, lua::lua_type(L, i)) }
+}
 
 #[inline(always)]
-pub unsafe fn luaL_dofile(L: *mut lua_State, filename: *const c_char) -> c_int { unsafe {
-    let status = luaL_loadfile(L, filename);
-    if status == 0 {
-        lua::lua_pcall(L, 0, lua::LUA_MULTRET, 0)
-    } else {
-        status
+pub unsafe fn luaL_dofile(L: *mut lua_State, filename: *const c_char) -> c_int {
+    unsafe {
+        let status = luaL_loadfile(L, filename);
+        if status == 0 {
+            lua::lua_pcall(L, 0, lua::LUA_MULTRET, 0)
+        } else {
+            status
+        }
     }
-}}
+}
 
 #[inline(always)]
-pub unsafe fn luaL_dostring(L: *mut lua_State, s: *const c_char) -> c_int { unsafe {
-    let status = luaL_loadstring(L, s);
-    if status == 0 {
-        lua::lua_pcall(L, 0, lua::LUA_MULTRET, 0)
-    } else {
-        status
+pub unsafe fn luaL_dostring(L: *mut lua_State, s: *const c_char) -> c_int {
+    unsafe {
+        let status = luaL_loadstring(L, s);
+        if status == 0 {
+            lua::lua_pcall(L, 0, lua::LUA_MULTRET, 0)
+        } else {
+            status
+        }
     }
-}}
+}
 
 #[inline(always)]
-pub unsafe fn luaL_getmetatable(L: *mut lua_State, n: *const c_char) { unsafe {
-    lua::lua_getfield(L, lua::LUA_REGISTRYINDEX, n);
-}}
+pub unsafe fn luaL_getmetatable(L: *mut lua_State, n: *const c_char) {
+    unsafe {
+        lua::lua_getfield(L, lua::LUA_REGISTRYINDEX, n);
+    }
+}
 
 #[inline(always)]
-pub unsafe fn luaL_loadbuffer(L: *mut lua_State, s: *const c_char, sz: usize, n: *const c_char) -> c_int { unsafe {
-    luaL_loadbufferx(L, s, sz, n, ptr::null())
-}}
+pub unsafe fn luaL_loadbuffer(
+    L: *mut lua_State,
+    s: *const c_char,
+    sz: usize,
+    n: *const c_char,
+) -> c_int {
+    unsafe { luaL_loadbufferx(L, s, sz, n, ptr::null()) }
+}
 
 pub unsafe fn luaL_loadbufferenv(
     L: *mut lua_State,
@@ -178,34 +215,38 @@ pub unsafe fn luaL_loadbufferenv(
     name: *const c_char,
     mode: *const c_char,
     mut env: c_int,
-) -> c_int { unsafe {
-    if env != 0 {
-        env = lua::lua_absindex(L, env);
-    }
-    let status = luaL_loadbufferx(L, data, size, name, mode);
-    if status == lua::LUA_OK && env != 0 {
-        lua::lua_pushvalue(L, env);
-        lua::lua_setupvalue(L, -2, 1);
-    }
-    status
-}}
-
-pub unsafe fn luaL_makeseed(_L: *mut lua_State) -> c_uint { unsafe {
-    #[cfg(target_os = "macos")]
-    {
-        return libc::arc4random();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let mut seed = 0u32;
-        let buf = &mut seed as *mut _ as *mut c_void;
-        if libc::getrandom(buf, 4, libc::GRND_NONBLOCK) == 4 {
-            return seed;
+) -> c_int {
+    unsafe {
+        if env != 0 {
+            env = lua::lua_absindex(L, env);
         }
+        let status = luaL_loadbufferx(L, data, size, name, mode);
+        if status == lua::LUA_OK && env != 0 {
+            lua::lua_pushvalue(L, env);
+            lua::lua_setupvalue(L, -2, 1);
+        }
+        status
     }
-    #[allow(unreachable_code)]
-    luaL_makeseed_(_L)
-}}
+}
+
+pub unsafe fn luaL_makeseed(_L: *mut lua_State) -> c_uint {
+    unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            return libc::arc4random();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut seed = 0u32;
+            let buf = &mut seed as *mut _ as *mut c_void;
+            if libc::getrandom(buf, 4, libc::GRND_NONBLOCK) == 4 {
+                return seed;
+            }
+        }
+        #[allow(unreachable_code)]
+        luaL_makeseed_(_L)
+    }
+}
 
 #[inline(always)]
 pub unsafe fn luaL_opt<T>(
@@ -213,13 +254,15 @@ pub unsafe fn luaL_opt<T>(
     f: unsafe extern "C-unwind" fn(*mut lua_State, c_int) -> T,
     n: c_int,
     d: T,
-) -> T { unsafe {
-    if lua::lua_isnoneornil(L, n) != 0 {
-        d
-    } else {
-        f(L, n)
+) -> T {
+    unsafe {
+        if lua::lua_isnoneornil(L, n) != 0 {
+            d
+        } else {
+            f(L, n)
+        }
     }
-}}
+}
 
 //
 // Generic Buffer Manipulation
@@ -253,7 +296,10 @@ pub struct luaL_Buffer {
     pub init: luaL_BufferInit, // initial buffer (union with alignment)
 }
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     pub fn luaL_buffinit(L: *mut lua_State, B: *mut luaL_Buffer);
     pub fn luaL_prepbuffsize(B: *mut luaL_Buffer, sz: usize) -> *mut c_char;
@@ -268,35 +314,41 @@ unsafe extern "C-unwind" {
 // Macro implementations as inline functions
 
 #[inline(always)]
-pub unsafe fn luaL_prepbuffer(B: *mut luaL_Buffer) -> *mut c_char { unsafe {
-    luaL_prepbuffsize(B, LUAL_BUFFERSIZE)
-}}
+pub unsafe fn luaL_prepbuffer(B: *mut luaL_Buffer) -> *mut c_char {
+    unsafe { luaL_prepbuffsize(B, LUAL_BUFFERSIZE) }
+}
 
 #[inline(always)]
-pub unsafe fn luaL_addchar(B: *mut luaL_Buffer, c: c_char) { unsafe {
-    if (*B).n >= (*B).size {
-        luaL_prepbuffsize(B, 1);
+pub unsafe fn luaL_addchar(B: *mut luaL_Buffer, c: c_char) {
+    unsafe {
+        if (*B).n >= (*B).size {
+            luaL_prepbuffsize(B, 1);
+        }
+        *(*B).b.add((*B).n) = c;
+        (*B).n += 1;
     }
-    *(*B).b.add((*B).n) = c;
-    (*B).n += 1;
-}}
+}
 
 #[inline(always)]
-pub unsafe fn luaL_addsize(B: *mut luaL_Buffer, n: usize) { unsafe {
-    (*B).n += n;
-}}
+pub unsafe fn luaL_addsize(B: *mut luaL_Buffer, n: usize) {
+    unsafe {
+        (*B).n += n;
+    }
+}
 
 #[inline(always)]
-pub unsafe fn luaL_buffsub(B: *mut luaL_Buffer, n: usize) { unsafe {
-    (*B).n -= n;
-}}
+pub unsafe fn luaL_buffsub(B: *mut luaL_Buffer, n: usize) {
+    unsafe {
+        (*B).n -= n;
+    }
+}
 
 #[inline(always)]
-pub unsafe fn luaL_bufflen(B: *mut luaL_Buffer) -> usize { unsafe {
-    (*B).n
-}}
+pub unsafe fn luaL_bufflen(B: *mut luaL_Buffer) -> usize {
+    unsafe { (*B).n }
+}
 
 #[inline(always)]
-pub unsafe fn luaL_buffaddr(B: *mut luaL_Buffer) -> *mut c_char { unsafe {
-    (*B).b
-}}
+pub unsafe fn luaL_buffaddr(B: *mut luaL_Buffer) -> *mut c_char {
+    unsafe { (*B).b }
+}

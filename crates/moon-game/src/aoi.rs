@@ -23,7 +23,7 @@
 //! The C++ version stores objects in a node-stable `std::unordered_map` and
 //! keeps raw `object*` pointers inside each tile. Rust's `HashMap` does not
 //! provide stable value addresses, so objects live in a dense slab
-//! (`Vec<AoiObject>`) and each tile stores a [`Slot`] (a `u32` index into the
+//! (`Vec<AoiObject>`) and each tile stores a `Slot` (a `u32` index into the
 //! slab) instead of a pointer. A `HashMap<Handle, Slot>` backs the public,
 //! handle-based API. The hot emit loops therefore resolve an object with a
 //! single `slab[slot]` array access — the direct analogue of the C++ pointer
@@ -258,13 +258,30 @@ impl Aoi {
         w: i32,
         h: i32,
     ) -> Rect {
-        let left = Self::calc_tile_x(map, tile_size, count, (x - w / 2).clamp(map.left(), map.right()));
-        let right =
-            Self::calc_tile_x(map, tile_size, count, (x + w / 2).clamp(map.left(), map.right())) + 1;
-        let bottom =
-            Self::calc_tile_y(map, tile_size, count, (y - h / 2).clamp(map.bottom(), map.top()));
-        let top =
-            Self::calc_tile_y(map, tile_size, count, (y + h / 2).clamp(map.bottom(), map.top())) + 1;
+        let left = Self::calc_tile_x(
+            map,
+            tile_size,
+            count,
+            (x - w / 2).clamp(map.left(), map.right()),
+        );
+        let right = Self::calc_tile_x(
+            map,
+            tile_size,
+            count,
+            (x + w / 2).clamp(map.left(), map.right()),
+        ) + 1;
+        let bottom = Self::calc_tile_y(
+            map,
+            tile_size,
+            count,
+            (y - h / 2).clamp(map.bottom(), map.top()),
+        );
+        let top = Self::calc_tile_y(
+            map,
+            tile_size,
+            count,
+            (y + h / 2).clamp(map.bottom(), map.top()),
+        ) + 1;
         if w == 0 || h == 0 {
             return Rect::new(left, bottom, 0, 0);
         }
@@ -281,11 +298,20 @@ impl Aoi {
         h: i32,
     ) -> Rect {
         let left = Self::calc_tile_x(map, tile_size, count, left_x.clamp(map.left(), map.right()));
-        let right =
-            Self::calc_tile_x(map, tile_size, count, (left_x + w).clamp(map.left(), map.right())) + 1;
-        let bottom = Self::calc_tile_y(map, tile_size, count, left_y.clamp(map.bottom(), map.top()));
-        let top =
-            Self::calc_tile_y(map, tile_size, count, (left_y + h).clamp(map.bottom(), map.top())) + 1;
+        let right = Self::calc_tile_x(
+            map,
+            tile_size,
+            count,
+            (left_x + w).clamp(map.left(), map.right()),
+        ) + 1;
+        let bottom =
+            Self::calc_tile_y(map, tile_size, count, left_y.clamp(map.bottom(), map.top()));
+        let top = Self::calc_tile_y(
+            map,
+            tile_size,
+            count,
+            (left_y + h).clamp(map.bottom(), map.top()),
+        ) + 1;
         if w == 0 || h == 0 {
             return Rect::new(left, bottom, 0, 0);
         }
@@ -673,7 +699,7 @@ impl Aoi {
                 }
                 Self::update_watcher(
                     &map,
-                            &self.slab,
+                    &self.slab,
                     option,
                     &mut self.event_queue,
                     &self.data[index],
@@ -700,7 +726,7 @@ impl Aoi {
                 }
                 Self::update_watcher(
                     &map,
-                            &self.slab,
+                    &self.slab,
                     option,
                     &mut self.event_queue,
                     &self.data[index],
@@ -1178,14 +1204,17 @@ impl Aoi {
                             continue;
                         }
                         let view = Self::calc_make_rect(&map, w.x, w.y, w.w, w.h);
-                        let was =
-                            w.layer <= old_layer && Self::marker_seen(&view, old_x, old_y, old_area);
-                        let is =
-                            w.layer <= obj.layer && Self::marker_seen(&view, obj.x, obj.y, new_area);
+                        let was = w.layer <= old_layer
+                            && Self::marker_seen(&view, old_x, old_y, old_area);
+                        let is = w.layer <= obj.layer
+                            && Self::marker_seen(&view, obj.x, obj.y, new_area);
                         if was && !is {
                             if option & ENABLE_LEAVE_EVENT != 0 {
-                                self.event_queue
-                                    .push(AoiEvent::new(EVENT_LEAVE, w.handle, obj.handle));
+                                self.event_queue.push(AoiEvent::new(
+                                    EVENT_LEAVE,
+                                    w.handle,
+                                    obj.handle,
+                                ));
                             }
                         } else if !was && is {
                             self.event_queue

@@ -2,8 +2,8 @@ use dashmap::{DashMap, DashSet};
 use lazy_static::lazy_static;
 use moon_base::{
     cstr, ffi,
-    laux::{self, LuaState},
-    lreg, lreg_null, luaL_newlib,
+    laux::{self, LuaStack, LuaState},
+    lreg, lreg_null, lreg_try, luaL_newlib,
 };
 use moon_runtime::{
     actor::LuaActor,
@@ -1050,12 +1050,16 @@ fn spawn_call_timeout_checker() {
 // Lua-facing C functions
 // ---------------------------------------------------------------------------
 
-extern "C-unwind" fn lua_cluster_init(state: LuaState) -> c_int {
-    let node_id: u32 = laux::lua_get(state, 1);
-    let discovery_url: String = laux::lua_get(state, 2);
+fn lua_cluster_init(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let node_id: u32 = lua.get(1)?;
+    let discovery_url: String = lua.get(2)?;
 
     if CLUSTER.initialized.load(Ordering::Acquire) {
-        return crate::lua_push_error(state, "cluster already initialized");
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            "cluster already initialized",
+        ));
     }
 
     CLUSTER.node_id.store(node_id, Ordering::Release);
@@ -1072,12 +1076,13 @@ extern "C-unwind" fn lua_cluster_init(state: LuaState) -> c_int {
     CLUSTER.initialized.store(true, Ordering::Release);
 
     laux::lua_push(state, true);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn lua_cluster_listen(state: LuaState) -> c_int {
+fn lua_cluster_listen(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     if !CLUSTER.initialized.load(Ordering::Acquire) {
-        return crate::lua_push_error(state, "cluster not initialized");
+        return crate::lua_push_error_tuple(state, "cluster not initialized");
     }
 
     let node_id = CLUSTER.node_id();
@@ -1123,20 +1128,25 @@ extern "C-unwind" fn lua_cluster_listen(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn lua_cluster_shutdown(state: LuaState) -> c_int {
+fn lua_cluster_shutdown(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     shutdown_cluster(ClusterCloseReason::Shutdown);
     laux::lua_push(state, true);
     1
 }
 
-extern "C-unwind" fn lua_cluster_send(state: LuaState) -> c_int {
+fn lua_cluster_send(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     if !CLUSTER.initialized.load(Ordering::Acquire) {
-        return crate::lua_push_error(state, "cluster not initialized");
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            "cluster not initialized",
+        ));
     }
 
-    let to_node: u32 = laux::lua_get(state, 1);
-    let to_sname: String = laux::lua_get(state, 2);
-    let body = check_buffer(state, 3);
+    let to_node: u32 = lua.get(1)?;
+    let to_sname: String = lua.get(2)?;
+    let body = check_buffer(lua, 3)?;
 
     let actor = LuaActor::from_lua_state(state);
     let from_addr = unsafe { (*actor).id };
@@ -1174,17 +1184,21 @@ extern "C-unwind" fn lua_cluster_send(state: LuaState) -> c_int {
         });
     }
 
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn lua_cluster_request(state: LuaState) -> c_int {
+fn lua_cluster_request(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     if !CLUSTER.initialized.load(Ordering::Acquire) {
-        return crate::lua_push_error(state, "cluster not initialized");
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            "cluster not initialized",
+        ));
     }
 
-    let to_node: u32 = laux::lua_get(state, 1);
-    let to_sname: String = laux::lua_get(state, 2);
-    let body = check_buffer(state, 3);
+    let to_node: u32 = lua.get(1)?;
+    let to_sname: String = lua.get(2)?;
+    let body = check_buffer(lua, 3)?;
 
     let actor = LuaActor::from_lua_state(state);
     let from_addr = unsafe { (*actor).id };
@@ -1269,7 +1283,7 @@ extern "C-unwind" fn lua_cluster_request(state: LuaState) -> c_int {
     }
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,11 +1292,11 @@ extern "C-unwind" fn lua_cluster_request(state: LuaState) -> c_int {
 
 pub extern "C-unwind" fn luaopen_cluster(state: LuaState) -> c_int {
     let l = [
-        lreg!("init", lua_cluster_init),
+        lreg_try!("init", lua_cluster_init),
         lreg!("listen", lua_cluster_listen),
         lreg!("shutdown", lua_cluster_shutdown),
-        lreg!("send", lua_cluster_send),
-        lreg!("request", lua_cluster_request),
+        lreg_try!("send", lua_cluster_send),
+        lreg_try!("request", lua_cluster_request),
         lreg_null!(),
     ];
 
@@ -1305,7 +1319,7 @@ pub extern "C-unwind" fn luaopen_cluster(state: LuaState) -> c_int {
 mod tests {
     use crate::context::ActorId;
 
-use super::*;
+    use super::*;
     use serial_test::{parallel, serial};
 
     fn reg_actor(id: ActorId) -> mpsc::UnboundedReceiver<Message> {
@@ -1907,6 +1921,10 @@ use super::*;
         client_read.read_to_end(&mut got).await.unwrap();
         // PING: 4-byte len (5) + "PING\n" = 9 bytes
         // BYE:  4-byte len (4) + "BYE\n"  = 8 bytes
-        assert_eq!(got.len(), 9 + 8, "expected both frames written before close");
+        assert_eq!(
+            got.len(),
+            9 + 8,
+            "expected both frames written before close"
+        );
     }
 }

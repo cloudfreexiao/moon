@@ -61,8 +61,8 @@ use tonic::{
 
 use moon_base::{
     cstr, ffi,
-    laux::{self, LuaState, LuaTable},
-    lreg, lreg_null, luaL_newlib,
+    laux::{self, LuaStack, LuaState, LuaTable},
+    lreg, lreg_null, lreg_try, luaL_newlib,
 };
 use moon_runtime::{
     actor::LuaActor,
@@ -154,7 +154,10 @@ enum GrpcResponse {
     /// **Server side**: a new inbound RPC arrived on a listener. Delivered with
     /// `session == 0` so it routes to the `grpc` protocol's `dispatch` handler.
     /// Decoded into `(path, server_stream_handle)`.
-    ServerRpc { path: String, handle: ServerStreamHandle },
+    ServerRpc {
+        path: String,
+        handle: ServerStreamHandle,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -241,13 +244,14 @@ fn apply_metadata<R>(request: &mut Request<R>, metadata: &[(String, String)]) {
 }
 
 /// Read an optional `metadata = { k = v }` table at `index` into owned pairs.
-fn read_metadata(state: LuaState, index: i32) -> Vec<(String, String)> {
+fn read_metadata(lua: &mut LuaStack<'_>, index: i32) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if laux::lua_type(state, index) != laux::LuaType::Table {
+    if lua.value(index).kind() != laux::LuaType::Table {
         return out;
     }
-    let table = LuaTable::from_stack(state, index);
-    for (key, value) in table.iter() {
+    for entry in lua.table_cursor(index) {
+        let key = entry.key();
+        let value = entry.value();
         out.push((key.to_string(), value.to_string()));
     }
     out
@@ -286,15 +290,22 @@ async fn build_channel(
     endpoint.connect().await.map_err(|e| e.to_string())
 }
 
-extern "C-unwind" fn grpc_connect(state: LuaState) -> c_int {
-    laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
+fn grpc_connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    laux::lua_checktype(state, 1, ffi::LUA_TTABLE)
+        .map_err(|err| format!("grpc.connect: argument #1 {err}"))?;
 
-    let endpoint: String = laux::opt_field(state, 1, "endpoint").unwrap_or_default();
+    let endpoint: String = lua.opt_field(1, "endpoint").unwrap_or_default();
     if endpoint.is_empty() {
-        return crate::lua_push_error(state, "grpc.connect: 'endpoint' is required");
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            "grpc.connect: 'endpoint' is required",
+        ));
     }
-    let name: String = laux::opt_field(state, 1, "name").unwrap_or_else(|| "default".to_string());
-    let connect_timeout: u64 = laux::opt_field(state, 1, "connect_timeout").unwrap_or(5000);
+    let name: String = lua
+        .opt_field(1, "name")
+        .unwrap_or_else(|| "default".to_string());
+    let connect_timeout: u64 = lua.opt_field(1, "connect_timeout").unwrap_or(5000);
 
     // TLS is enabled implicitly for https endpoints, or explicitly via a `tls`
     // table. Read any PEM material now, on the Lua thread.
@@ -307,10 +318,10 @@ extern "C-unwind" fn grpc_connect(state: LuaState) -> c_int {
         if laux::lua_type(state, -1) == laux::LuaType::Table {
             tls.enabled = true;
             let top = laux::lua_top(state);
-            tls.domain = laux::opt_field(state, top, "domain");
-            tls.ca = laux::opt_field::<&[u8]>(state, top, "ca").map(|b| b.to_vec());
-            tls.cert = laux::opt_field::<&[u8]>(state, top, "cert").map(|b| b.to_vec());
-            tls.key = laux::opt_field::<&[u8]>(state, top, "key").map(|b| b.to_vec());
+            tls.domain = lua.opt_field(top, "domain");
+            tls.ca = lua.opt_field::<Vec<u8>>(top, "ca");
+            tls.cert = lua.opt_field::<Vec<u8>>(top, "cert");
+            tls.key = lua.opt_field::<Vec<u8>>(top, "key");
         }
         ffi::lua_pop(state.as_ptr(), 1);
     }
@@ -323,7 +334,8 @@ extern "C-unwind" fn grpc_connect(state: LuaState) -> c_int {
         match build_channel(endpoint, connect_timeout, tls).await {
             Ok(channel) => {
                 GRPC_CONNECTIONS.insert(name, channel);
-                let _ = CONTEXT.send_value(context::PTYPE_GRPC, owner, session, GrpcResponse::Connect);
+                let _ =
+                    CONTEXT.send_value(context::PTYPE_GRPC, owner, session, GrpcResponse::Connect);
             }
             Err(err) => {
                 let _ = CONTEXT.send_value(
@@ -337,17 +349,22 @@ extern "C-unwind" fn grpc_connect(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn grpc_close(state: LuaState) -> c_int {
-    let name = unsafe { laux::lua_check_str(state, 1) };
+fn grpc_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let name = match lua.value(1).as_str() {
+        Some(name) => name,
+        None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
+    };
     GRPC_CONNECTIONS.remove(name);
     laux::lua_push(state, true);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn grpc_stats(state: LuaState) -> c_int {
+fn grpc_stats(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     let table = LuaTable::new(state, 0, 3);
     table.insert("connections", GRPC_CONNECTIONS.len() as i64);
     table.insert("streams", GRPC_STREAMS.len() as i64);
@@ -355,14 +372,18 @@ extern "C-unwind" fn grpc_stats(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn grpc_find_connection(state: LuaState) -> c_int {
-    let name = unsafe { laux::lua_check_str(state, 1) };
+fn grpc_find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let name = match lua.value(1).as_str() {
+        Some(name) => name,
+        None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
+    };
     match GRPC_CONNECTIONS.get(name) {
         Some(entry) => {
             let l = [
-                lreg!("unary", conn_unary),
-                lreg!("server_stream", conn_server_stream),
-                lreg!("bidi_stream", conn_bidi_stream),
+                lreg_try!("unary", conn_unary),
+                lreg_try!("server_stream", conn_server_stream),
+                lreg_try!("bidi_stream", conn_bidi_stream),
                 lreg_null!(),
             ];
             if laux::lua_newuserdata(
@@ -378,7 +399,7 @@ extern "C-unwind" fn grpc_find_connection(state: LuaState) -> c_int {
         }
         None => laux::lua_pushnil(state),
     }
-    1
+    Ok(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -386,11 +407,14 @@ extern "C-unwind" fn grpc_find_connection(state: LuaState) -> c_int {
 // ---------------------------------------------------------------------------
 
 /// Validate & read the request body (raw protobuf bytes) at `index`.
-fn read_body(state: LuaState, index: i32) -> Result<Vec<u8>, String> {
-    let body = match laux::lua_type(state, index) {
-        laux::LuaType::String => unsafe { laux::lua_check_lstring(state, index) }.to_vec(),
+fn read_body(lua: &LuaStack<'_>, index: i32) -> Result<Vec<u8>, String> {
+    let value = lua.value(index);
+    let body = match value.kind() {
+        laux::LuaType::String => value.as_bytes().unwrap_or_default().to_vec(),
         laux::LuaType::LightUserData => {
-            let ptr = unsafe { ffi::lua_touserdata(state.as_ptr(), index) };
+            let ptr = value
+                .as_light_userdata()
+                .expect("lightuserdata type checked");
             if ptr.is_null() {
                 return Err("grpc: request body pointer is null".to_string());
             }
@@ -410,23 +434,33 @@ fn read_body(state: LuaState, index: i32) -> Result<Vec<u8>, String> {
 }
 
 /// `handle:unary(path, request_bytes, timeout?, metadata?)` -> session
-extern "C-unwind" fn conn_unary(state: LuaState) -> c_int {
-    let channel_ref =
-        laux::lua_touserdata::<Channel>(state, 1).expect("invalid grpc connection pointer");
+fn conn_unary(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let channel_ptr = lua
+        .value(1)
+        .as_userdata::<Channel>()
+        .expect("invalid grpc connection pointer");
     // Do every operation that can longjmp (arg validation) *before* cloning the
     // owned `Channel`, so a raised Lua error can't leak the clone.
-    let path_str = unsafe { laux::lua_check_str(state, 2) }.to_string();
+    let path_str = lua
+        .get::<String>(2)
+        .map_err(|err| format!("grpc.unary: {err}"))?;
     let path = match PathAndQuery::try_from(path_str.clone()) {
         Ok(p) => p,
-        Err(e) => return crate::lua_push_error(state, &format!("grpc: invalid path '{}': {}", path_str, e)),
+        Err(e) => {
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("grpc: invalid path '{}': {}", path_str, e),
+            ));
+        }
     };
-    let body = match read_body(state, 3) {
-        Ok(b) => b,
-        Err(e) => return crate::lua_push_error(state, &e),
+    let body = match read_body(lua, 3) {
+        Ok(body) => body,
+        Err(error) => return Ok(crate::lua_push_error_tuple(state, &error)),
     };
-    let timeout: u64 = laux::lua_opt(state, 4).unwrap_or(0);
-    let metadata = read_metadata(state, 5);
-    let channel = channel_ref.clone();
+    let timeout: u64 = lua.opt(4).unwrap_or(0);
+    let metadata = read_metadata(lua, 5);
+    let channel = unsafe { channel_ptr.as_ref().clone() };
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -470,7 +504,7 @@ extern "C-unwind" fn conn_unary(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
 /// The body of the recv loop: serially answer `recv` requests by pulling the
@@ -552,21 +586,31 @@ fn spawn_recv_loop(
 
 /// `handle:server_stream(path, request_bytes, timeout?, metadata?)` -> session.
 /// Reply is `StreamOpen(fd)` once the response stream is established.
-extern "C-unwind" fn conn_server_stream(state: LuaState) -> c_int {
-    let channel_ref =
-        laux::lua_touserdata::<Channel>(state, 1).expect("invalid grpc connection pointer");
-    let path_str = unsafe { laux::lua_check_str(state, 2) }.to_string();
+fn conn_server_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let channel_ptr = lua
+        .value(1)
+        .as_userdata::<Channel>()
+        .expect("invalid grpc connection pointer");
+    let path_str = lua
+        .get::<String>(2)
+        .map_err(|err| format!("grpc.server_stream: {err}"))?;
     let path = match PathAndQuery::try_from(path_str.clone()) {
         Ok(p) => p,
-        Err(e) => return crate::lua_push_error(state, &format!("grpc: invalid path '{}': {}", path_str, e)),
+        Err(e) => {
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("grpc: invalid path '{}': {}", path_str, e),
+            ));
+        }
     };
-    let body = match read_body(state, 3) {
-        Ok(b) => b,
-        Err(e) => return crate::lua_push_error(state, &e),
+    let body = match read_body(lua, 3) {
+        Ok(body) => body,
+        Err(error) => return Ok(crate::lua_push_error_tuple(state, &error)),
     };
-    let timeout: u64 = laux::lua_opt(state, 4).unwrap_or(0);
-    let metadata = read_metadata(state, 5);
-    let channel = channel_ref.clone();
+    let timeout: u64 = lua.opt(4).unwrap_or(0);
+    let metadata = read_metadata(lua, 5);
+    let channel = unsafe { channel_ptr.as_ref().clone() };
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -629,22 +673,32 @@ extern "C-unwind" fn conn_server_stream(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
 /// `handle:bidi_stream(path, timeout?, metadata?)` -> session.
 /// Covers both client-streaming and bidirectional-streaming methods.
-extern "C-unwind" fn conn_bidi_stream(state: LuaState) -> c_int {
-    let channel_ref =
-        laux::lua_touserdata::<Channel>(state, 1).expect("invalid grpc connection pointer");
-    let path_str = unsafe { laux::lua_check_str(state, 2) }.to_string();
+fn conn_bidi_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let channel_ptr = lua
+        .value(1)
+        .as_userdata::<Channel>()
+        .expect("invalid grpc connection pointer");
+    let path_str = lua
+        .get::<String>(2)
+        .map_err(|err| format!("grpc.bidi_stream: {err}"))?;
     let path = match PathAndQuery::try_from(path_str.clone()) {
         Ok(p) => p,
-        Err(e) => return crate::lua_push_error(state, &format!("grpc: invalid path '{}': {}", path_str, e)),
+        Err(e) => {
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("grpc: invalid path '{}': {}", path_str, e),
+            ));
+        }
     };
-    let timeout: u64 = laux::lua_opt(state, 3).unwrap_or(0);
-    let metadata = read_metadata(state, 4);
-    let channel = channel_ref.clone();
+    let timeout: u64 = lua.opt(3).unwrap_or(0);
+    let metadata = read_metadata(lua, 4);
+    let channel = unsafe { channel_ptr.as_ref().clone() };
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -730,19 +784,25 @@ extern "C-unwind" fn conn_bidi_stream(state: LuaState) -> c_int {
                 abort,
             },
         );
-        let _ = CONTEXT.send_value(context::PTYPE_GRPC, owner, session, GrpcResponse::StreamOpen(fd));
+        let _ = CONTEXT.send_value(
+            context::PTYPE_GRPC,
+            owner,
+            session,
+            GrpcResponse::StreamOpen(fd),
+        );
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
 // ---------------------------------------------------------------------------
 // Stream-handle methods: recv / send / close_send / close
 // ---------------------------------------------------------------------------
 
-extern "C-unwind" fn grpc_find_stream(state: LuaState) -> c_int {
-    let fd: i64 = laux::lua_get(state, 1);
+fn grpc_find_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let fd: i64 = lua.get(1)?;
     match GRPC_STREAMS.get(&fd) {
         Some(entry) => {
             let l = [
@@ -762,13 +822,18 @@ extern "C-unwind" fn grpc_find_stream(state: LuaState) -> c_int {
         }
         None => laux::lua_pushnil(state),
     }
-    1
+    Ok(1)
 }
 
 type StreamUserdata = (i64, StreamHandle);
 
-extern "C-unwind" fn stream_recv(state: LuaState) -> c_int {
-    let ud = laux::lua_touserdata::<StreamUserdata>(state, 1).expect("invalid grpc stream pointer");
+fn stream_recv(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let ud_ptr = lua
+        .value(1)
+        .as_userdata::<StreamUserdata>()
+        .expect("invalid grpc stream pointer");
+    let ud = unsafe { ud_ptr.as_ref() };
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -780,23 +845,33 @@ extern "C-unwind" fn stream_recv(state: LuaState) -> c_int {
             1
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
-            crate::lua_push_error(state, "grpc stream: a recv is already pending")
+            crate::lua_push_error_tuple(state, "grpc stream: a recv is already pending")
         }
-        Err(_) => crate::lua_push_error(state, "grpc stream: closed"),
+        Err(_) => crate::lua_push_error_tuple(state, "grpc stream: closed"),
     }
 }
 
-extern "C-unwind" fn stream_send(state: LuaState) -> c_int {
-    let ud = laux::lua_touserdata::<StreamUserdata>(state, 1).expect("invalid grpc stream pointer");
+fn stream_send(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let ud_ptr = lua
+        .value(1)
+        .as_userdata::<StreamUserdata>()
+        .expect("invalid grpc stream pointer");
+    let ud = unsafe { ud_ptr.as_ref() };
 
     let tx = match &ud.1.tx_send {
         Some(tx) => tx,
-        None => return crate::lua_push_error(state, "grpc stream: this RPC has no request stream"),
+        None => {
+            return crate::lua_push_error_tuple(
+                state,
+                "grpc stream: this RPC has no request stream",
+            );
+        }
     };
 
-    let body = match read_body(state, 2) {
+    let body = match read_body(lua, 2) {
         Ok(b) => b,
-        Err(e) => return crate::lua_push_error(state, &e),
+        Err(e) => return crate::lua_push_error_tuple(state, &e),
     };
 
     match tx.send(Some(body)) {
@@ -804,12 +879,17 @@ extern "C-unwind" fn stream_send(state: LuaState) -> c_int {
             laux::lua_push(state, true);
             1
         }
-        Err(_) => crate::lua_push_error(state, "grpc stream: send failed (stream closed)"),
+        Err(_) => crate::lua_push_error_tuple(state, "grpc stream: send failed (stream closed)"),
     }
 }
 
-extern "C-unwind" fn stream_close_send(state: LuaState) -> c_int {
-    let ud = laux::lua_touserdata::<StreamUserdata>(state, 1).expect("invalid grpc stream pointer");
+fn stream_close_send(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let ud_ptr = lua
+        .value(1)
+        .as_userdata::<StreamUserdata>()
+        .expect("invalid grpc stream pointer");
+    let ud = unsafe { ud_ptr.as_ref() };
 
     match &ud.1.tx_send {
         Some(tx) => {
@@ -817,12 +897,17 @@ extern "C-unwind" fn stream_close_send(state: LuaState) -> c_int {
             laux::lua_push(state, true);
             1
         }
-        None => crate::lua_push_error(state, "grpc stream: this RPC has no request stream"),
+        None => crate::lua_push_error_tuple(state, "grpc stream: this RPC has no request stream"),
     }
 }
 
-extern "C-unwind" fn stream_close(state: LuaState) -> c_int {
-    let ud = laux::lua_touserdata::<StreamUserdata>(state, 1).expect("invalid grpc stream pointer");
+fn stream_close(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let ud_ptr = lua
+        .value(1)
+        .as_userdata::<StreamUserdata>()
+        .expect("invalid grpc stream pointer");
+    let ud = unsafe { ud_ptr.as_ref() };
     let fd = ud.0;
 
     if let Some((_, entry)) = GRPC_STREAMS.remove(&fd) {
@@ -945,35 +1030,40 @@ async fn handle_grpc_request(
 /// `grpc.core.listen(addr, opts?)` -> listener fd. `opts.max_connections`
 /// bounds concurrent connections. Inbound RPCs are delivered to the calling
 /// actor via the `grpc` protocol dispatch handler.
-extern "C-unwind" fn grpc_listen(state: LuaState) -> c_int {
+fn grpc_listen(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let _guard = CONTEXT.io_runtime().enter();
-
-    let addr = unsafe { laux::lua_check_str(state, 1) };
+    let state = lua.state();
 
     let max_connections: usize = if laux::lua_type(state, 2) == laux::LuaType::Table {
-        laux::opt_field(state, 2, "max_connections").unwrap_or(LIMITS.listener_connections)
+        lua.opt_field(2, "max_connections")
+            .unwrap_or(LIMITS.listener_connections)
     } else {
         LIMITS.listener_connections
     };
 
+    let addr = match lua.value(1).as_str() {
+        Some(addr) => addr,
+        None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
+    };
+
     let socket_addr: SocketAddr = match addr.parse() {
         Ok(a) => a,
-        Err(e) => laux::lua_error(state, format!("grpc listen '{}' failed: {}", addr, e)),
+        Err(e) => return Err(format!("grpc listen '{}' failed: {}", addr, e)),
     };
     let listener = match std::net::TcpListener::bind(socket_addr) {
         Ok(l) => l,
-        Err(e) => laux::lua_error(state, format!("grpc listen '{}' failed: {}", addr, e)),
+        Err(e) => return Err(format!("grpc listen '{}' failed: {}", addr, e)),
     };
     if let Err(e) = listener.set_nonblocking(true) {
         // Release the bound socket before the longjmp; `lua_error` never returns
         // so the listener's `Drop` would otherwise be skipped.
         let msg = format!("grpc listen '{}' failed: {}", addr, e);
         drop(listener);
-        laux::lua_error(state, msg);
+        return Err(msg);
     }
     let listener = match TcpListener::from_std(listener) {
         Ok(l) => l,
-        Err(e) => laux::lua_error(state, format!("grpc listen '{}' failed: {}", addr, e)),
+        Err(e) => return Err(format!("grpc listen '{}' failed: {}", addr, e)),
     };
 
     let actor = LuaActor::from_lua_state(state);
@@ -1026,19 +1116,20 @@ extern "C-unwind" fn grpc_listen(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, fd);
-    1
+    Ok(1)
 }
 
 /// `grpc.core.stop(fd)` -> bool. Cancels the listener accept loop.
-extern "C-unwind" fn grpc_server_close(state: LuaState) -> c_int {
-    let fd: i64 = laux::lua_get(state, 1);
+fn grpc_server_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let fd: i64 = lua.get(1)?;
     if let Some((_, token)) = GRPC_SERVERS.remove(&fd) {
         token.cancel();
         laux::lua_push(state, true);
     } else {
         laux::lua_push(state, false);
     }
-    1
+    Ok(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,9 +1138,13 @@ extern "C-unwind" fn grpc_server_close(state: LuaState) -> c_int {
 
 /// `handle:recv()` -> session. Resolves to the next inbound request message
 /// (raw bytes), `nil` at clean end-of-request-stream, or `(nil, err)` on error.
-extern "C-unwind" fn server_recv(state: LuaState) -> c_int {
-    let ud = laux::lua_touserdata::<ServerStreamHandle>(state, 1)
+fn server_recv(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let ud_ptr = lua
+        .value(1)
+        .as_userdata::<ServerStreamHandle>()
         .expect("invalid grpc server stream pointer");
+    let ud = unsafe { ud_ptr.as_ref() };
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -1061,24 +1156,28 @@ extern "C-unwind" fn server_recv(state: LuaState) -> c_int {
             1
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
-            crate::lua_push_error(state, "grpc server stream: a recv is already pending")
+            crate::lua_push_error_tuple(state, "grpc server stream: a recv is already pending")
         }
-        Err(_) => crate::lua_push_error(state, "grpc server stream: request stream closed"),
+        Err(_) => crate::lua_push_error_tuple(state, "grpc server stream: request stream closed"),
     }
 }
 
 /// `handle:send(bytes)` -> bool. Pushes one response message (raw bytes).
-extern "C-unwind" fn server_send(state: LuaState) -> c_int {
-    let ud = laux::lua_touserdata::<ServerStreamHandle>(state, 1)
+fn server_send(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let ud_ptr = lua
+        .value(1)
+        .as_userdata::<ServerStreamHandle>()
         .expect("invalid grpc server stream pointer");
+    let ud = unsafe { ud_ptr.as_ref() };
 
     if ud.finished.load(Ordering::Acquire) {
-        return crate::lua_push_error(state, "grpc server stream: already finished");
+        return crate::lua_push_error_tuple(state, "grpc server stream: already finished");
     }
 
-    let body = match read_body(state, 2) {
+    let body = match read_body(lua, 2) {
         Ok(b) => b,
-        Err(e) => return crate::lua_push_error(state, &e),
+        Err(e) => return crate::lua_push_error_tuple(state, &e),
     };
 
     match ud.tx_resp.send(Some(Ok(Bytes::from(body)))) {
@@ -1086,23 +1185,25 @@ extern "C-unwind" fn server_send(state: LuaState) -> c_int {
             laux::lua_push(state, true);
             1
         }
-        Err(_) => crate::lua_push_error(state, "grpc server stream: send failed (client gone)"),
+        Err(_) => {
+            crate::lua_push_error_tuple(state, "grpc server stream: send failed (client gone)")
+        }
     }
 }
 
 /// `handle:finish(code?, message?)` -> bool. Ends the response stream with the
 /// given gRPC status (default OK = 0). Idempotent.
-extern "C-unwind" fn server_finish(state: LuaState) -> c_int {
-    let ud = laux::lua_touserdata::<ServerStreamHandle>(state, 1)
+fn server_finish(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let ud_ptr = lua
+        .value(1)
+        .as_userdata::<ServerStreamHandle>()
         .expect("invalid grpc server stream pointer");
+    let ud = unsafe { ud_ptr.as_ref() };
 
-    let code: i32 = laux::lua_opt(state, 2).unwrap_or(0);
+    let code: i32 = lua.opt(2).unwrap_or(0);
     // Read the optional message only when it really is a string (avoid longjmp).
-    let message = if laux::lua_type(state, 3) == laux::LuaType::String {
-        unsafe { laux::lua_check_str(state, 3) }.to_string()
-    } else {
-        String::new()
-    };
+    let message = lua.value(3).as_str().unwrap_or_default().to_owned();
 
     if ud.finished.swap(true, Ordering::AcqRel) {
         laux::lua_push(state, true);
@@ -1110,7 +1211,9 @@ extern "C-unwind" fn server_finish(state: LuaState) -> c_int {
     }
 
     if code != 0 {
-        let _ = ud.tx_resp.send(Some(Err(Status::new(Code::from(code), message))));
+        let _ = ud
+            .tx_resp
+            .send(Some(Err(Status::new(Code::from(code), message))));
     }
     // End-of-stream sentinel: terminates the response stream (OK trailer unless
     // an error item was sent just above).
@@ -1156,7 +1259,7 @@ fn push_grpc_response(state: LuaState, response: GrpcResponse) -> c_int {
             laux::lua_pushnil(state);
             1
         }
-        GrpcResponse::Error(err) => crate::lua_push_error(state, err.as_str()),
+        GrpcResponse::Error(err) => crate::lua_push_error_tuple(state, err.as_str()),
         GrpcResponse::ServerRpc { path, handle } => {
             laux::lua_push(state, path.as_str());
             let l = [
@@ -1186,19 +1289,19 @@ pub unsafe extern "C-unwind" fn decode_grpc_message(
 ) -> c_int {
     match unsafe { crate::message_decode::take_boxed::<GrpcResponse>(m) } {
         Ok(response) => push_grpc_response(state, response),
-        Err(e) => crate::lua_push_error(state, &e),
+        Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
 
 pub extern "C-unwind" fn luaopen_grpc(state: LuaState) -> c_int {
     let l = [
-        lreg!("connect", grpc_connect),
-        lreg!("close", grpc_close),
-        lreg!("find_connection", grpc_find_connection),
-        lreg!("find_stream", grpc_find_stream),
+        lreg_try!("connect", grpc_connect),
+        lreg_try!("close", grpc_close),
+        lreg_try!("find_connection", grpc_find_connection),
+        lreg_try!("find_stream", grpc_find_stream),
         lreg!("stats", grpc_stats),
-        lreg!("listen", grpc_listen),
-        lreg!("stop", grpc_server_close),
+        lreg_try!("listen", grpc_listen),
+        lreg_try!("stop", grpc_server_close),
         lreg_null!(),
     ];
 

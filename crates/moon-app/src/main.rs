@@ -1,14 +1,13 @@
 use mimalloc::MiMalloc;
 use moon_base::{
     self, cstr, ffi,
-    laux::{self, LuaState},
+    laux::{self, LuaStack, LuaState},
 };
-use moon_runtime::{lua_actor, not_null_wrapper};
 use moon_runtime::{
     context::{self, CLUSTER_ACTOR_ADDR, CONTEXT, LOGGER, LuaActorParam},
     error::{Error, Result},
 };
-use tokio::sync::mpsc;
+use moon_runtime::{lua_actor, not_null_wrapper};
 use std::{
     env,
     ffi::CString,
@@ -16,9 +15,17 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use tokio::sync::mpsc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+fn stack_error_message(lua: &LuaStack<'_>) -> String {
+    lua.value(-1)
+        .as_string_lossy()
+        .map(|message| message.into_owned())
+        .unwrap_or_else(|| "unknown error".to_string())
+}
 
 fn print_usage() {
     println!("Usage:");
@@ -202,6 +209,7 @@ async fn async_main() -> Result<()> {
         unsafe {
             let lua = LuaState::new(ffi::luaL_newstate());
             let lua_state = lua.unwrap();
+            let mut lua_context = LuaStack::from_raw(lua_state);
             ffi::luaL_openlibs(lua_state.as_ptr());
             ffi::lua_pushboolean(lua_state.as_ptr(), 1);
             ffi::lua_setglobal(lua_state.as_ptr(), cstr!("__init__"));
@@ -210,39 +218,32 @@ async fn async_main() -> Result<()> {
             assert_eq!(ffi::lua_gettop(lua_state.as_ptr()), 1);
 
             if ffi::LUA_OK
-                != ffi::luaL_loadstring(
-                    lua_state.as_ptr(),
-                    CString::new(contents)?.as_ptr(),
-                )
+                != ffi::luaL_loadstring(lua_state.as_ptr(), CString::new(contents)?.as_ptr())
             {
                 return Err(Error::Custom(format!(
                     "loadstring {}",
-                    laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string())
+                    stack_error_message(&lua_context)
                 )));
             }
 
             if ffi::LUA_OK
                 != ffi::luaL_dostring(lua_state.as_ptr(), CString::new(arg.as_str())?.as_ptr())
             {
-                return Err(Error::Custom(
-                    laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
-                ));
+                return Err(Error::Custom(stack_error_message(&lua_context)));
             }
 
             if ffi::LUA_OK != ffi::lua_pcall(lua_state.as_ptr(), 1, 1, 1) {
-                return Err(Error::Custom(
-                    laux::lua_opt(lua_state, -1).unwrap_or("unknown error".to_string()),
-                ));
+                return Err(Error::Custom(stack_error_message(&lua_context)));
             }
 
             if ffi::LUA_TTABLE != ffi::lua_type(lua_state.as_ptr(), -1) {
                 return Err(Error::Custom("init code must return a table".to_string()));
             }
 
-            logfile = laux::opt_field(lua_state, -1, "logfile");
-            enable_stdout = laux::opt_field(lua_state, -1, "enable_stdout").unwrap_or(true);
-            loglevel = laux::opt_field(lua_state, -1, "loglevel").unwrap_or_default();
-            let mut path: String = laux::opt_field(lua_state, -1, "path").unwrap_or_default();
+            logfile = lua_context.opt_field(-1, "logfile");
+            enable_stdout = lua_context.opt_field(-1, "enable_stdout").unwrap_or(true);
+            loglevel = lua_context.opt_field(-1, "loglevel").unwrap_or_default();
+            let mut path: String = lua_context.opt_field(-1, "path").unwrap_or_default();
             if !path.is_empty() {
                 path = format!("package.path='{};'..package.path;", path);
                 CONTEXT.set_env("PATH", path.as_bytes());
@@ -420,4 +421,27 @@ async fn async_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stack_error_message_lossily_decodes_invalid_utf8() {
+        unsafe {
+            let raw = ffi::luaL_newstate();
+            let state = LuaState::new(raw).expect("Lua state allocation failed");
+            let bytes = b"error:\xff";
+            ffi::lua_pushlstring(raw, bytes.as_ptr().cast(), bytes.len());
+
+            let message = {
+                let lua = LuaStack::from_raw(state);
+                stack_error_message(&lua)
+            };
+
+            assert_eq!(message, "error:\u{fffd}");
+            ffi::lua_close(raw);
+        }
+    }
 }

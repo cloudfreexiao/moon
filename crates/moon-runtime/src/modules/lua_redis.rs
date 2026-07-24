@@ -15,11 +15,11 @@ use crate::request_pool::{
 };
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use moon_base::laux::LuaState;
+use moon_base::laux::{LuaStack, LuaState};
 use moon_base::{
     cstr, ffi, laux,
-    laux::{LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib, push_lua_table,
+    laux::{LuaTable, LuaType},
+    lreg, lreg_null, lreg_try, luaL_newlib, push_lua_table,
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
@@ -71,8 +71,7 @@ impl ConnectConfig {
     ///   * `read_timeout` — read timeout in ms (default 10000)
     ///   * `queue_capacity` — per-worker request queue capacity (default 1024)
     fn parse(url_str: &str) -> Result<Self, String> {
-        let url =
-            url::Url::parse(url_str).map_err(|e| format!("invalid connection url: {}", e))?;
+        let url = url::Url::parse(url_str).map_err(|e| format!("invalid connection url: {}", e))?;
         match url.scheme() {
             "redis" => {}
             other => return Err(format!("unsupported scheme '{}', expected redis", other)),
@@ -830,43 +829,40 @@ async fn worker_loop(
 /// Encode one Lua value as a RESP bulk string into `buf`.
 /// Tables are automatically JSON-encoded. Returns an error for
 /// unsupported types or JSON encoding failures.
-fn write_bulk_arg(buf: &mut Vec<u8>, state: LuaState, idx: i32) -> Result<(), String> {
-    let val = LuaValue::from_stack(state, idx);
-    match val {
-        LuaValue::Nil | LuaValue::None => {
+fn write_bulk_arg(buf: &mut Vec<u8>, lua: &mut LuaStack<'_>, idx: i32) -> Result<(), String> {
+    let value = lua.value(idx);
+    match value.kind() {
+        LuaType::Nil | LuaType::None => {
             buf.extend_from_slice(b"$-1\r\n");
         }
-        LuaValue::Integer(v) => {
+        LuaType::Integer => {
+            let v = value.as_integer().unwrap_or_default();
             let mut tmp = [0u8; lexical_core::BUFFER_SIZE];
             let written = lexical_core::write(v, &mut tmp);
             write_bulk_bytes(buf, written);
         }
-        LuaValue::Number(v) => {
+        LuaType::Number => {
+            let v = value.as_number().unwrap_or_default();
             let mut tmp = [0u8; lexical_core::BUFFER_SIZE];
             let written = lexical_core::write(v, &mut tmp);
             write_bulk_bytes(buf, written);
         }
-        LuaValue::Boolean(v) => {
+        LuaType::Boolean => {
+            let v = value.as_bool().unwrap_or(false);
             write_bulk_bytes(buf, if v { b"1" } else { b"0" });
         }
-        LuaValue::String(s) => {
-            write_bulk_bytes(buf, s);
+        LuaType::String => {
+            write_bulk_bytes(buf, value.as_bytes().unwrap_or_default());
         }
-        LuaValue::Table(tbl) => {
+        LuaType::Table => {
             let options = crate::lua_json::JsonOptions::default();
             let mut json = Vec::with_capacity(64);
-            crate::lua_json::encode_table(&mut json, &tbl, 0, false, &options)
+            crate::lua_json::encode_table(&mut json, lua, idx, 0, false, &options)
                 .map_err(|e| format!("JSON encode failed: {}", e))?;
             write_bulk_bytes(buf, &json);
         }
         _ => {
-            let type_name = unsafe {
-                let tp = ffi::lua_type(state.as_ptr(), idx);
-                std::ffi::CStr::from_ptr(ffi::lua_typename(state.as_ptr(), tp))
-                    .to_str()
-                    .unwrap_or("unknown")
-            };
-            return Err(format!("unsupported type: {}", type_name));
+            return Err(format!("unsupported type: {}", value.name()));
         }
     }
     Ok(())
@@ -889,20 +885,26 @@ fn write_bulk_bytes(buf: &mut Vec<u8>, data: &[u8]) {
 const REDIS_POOL_META: *const std::ffi::c_char = cstr!("redis_pool_metatable");
 const REDIS_WATCH_META: *const std::ffi::c_char = cstr!("redis_watch_metatable");
 
-fn collect_string_args(state: LuaState, start: i32) -> Vec<String> {
-    let top = laux::lua_top(state);
+fn collect_string_args(lua: &LuaStack<'_>, start: i32) -> Result<Vec<String>, String> {
+    let top = lua.top();
     let mut out = Vec::with_capacity((top - start + 1) as usize);
     for i in start..=top {
-        out.push(unsafe { laux::lua_check_str(state, i) }.to_string());
+        out.push(
+            lua.get::<String>(i)
+                .map_err(|err| format!("redis.watch: {err}"))?,
+        );
     }
-    out
+    Ok(out)
 }
 
 /// `redis.connect(url)`
 ///
 /// `url`: `redis://username:password@host:port/db?name=...&pool_size=...`
-extern "C-unwind" fn connect(state: LuaState) -> c_int {
-    let url = unsafe { laux::lua_check_str(state, 1) }.to_string();
+fn connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let url = lua
+        .get::<String>(1)
+        .map_err(|err| format!("redis.connect: {err}"))?;
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -972,41 +974,45 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
                 let _ = w.tx().send(RedisMessage::Shutdown).await;
             }
         }
-        let _ =
-            CONTEXT.send_value(context::PTYPE_REDIS, owner, session, RedisResponse::Connect(name));
+        let _ = CONTEXT.send_value(
+            context::PTYPE_REDIS,
+            owner,
+            session,
+            RedisResponse::Connect(name),
+        );
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
-    let name = unsafe { laux::lua_check_str(state, 1) };
-    match REDIS_CONNECTIONS.get(name) {
-        Some(pair) => {
+fn find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let pool = {
+        let name = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "redis.find_connection: UTF-8 string expected".to_string())?;
+        REDIS_CONNECTIONS.get(name).map(|pair| pair.value().clone())
+    };
+    match pool {
+        Some(pool) => {
             let methods = [
                 lreg!("command", command),
-                lreg!("pipeline", pipeline),
+                lreg_try!("pipeline", pipeline),
                 lreg!("exec_command", exec_command),
-                lreg!("exec_pipeline", exec_pipeline),
+                lreg_try!("exec_pipeline", exec_pipeline),
                 lreg!("len", pool_len),
                 lreg!("close", close),
                 lreg_null!(),
             ];
-            if laux::lua_newuserdata(
-                state,
-                pair.value().clone(),
-                REDIS_POOL_META,
-                methods.as_ref(),
-            )
-            .is_none()
-            {
+            if laux::lua_newuserdata(state, pool, REDIS_POOL_META, methods.as_ref()).is_none() {
                 laux::lua_pushnil(state);
             }
         }
         None => laux::lua_pushnil(state),
     }
-    1
+    Ok(1)
 }
 
 fn dispatch_async(state: LuaState, pool: &RedisPool, data: Vec<u8>, reply_count: u32) -> c_int {
@@ -1040,15 +1046,20 @@ fn dispatch_forget(state: LuaState, pool: &RedisPool, data: Vec<u8>, reply_count
 }
 
 /// `handle:command(cmd, arg1, arg2, ...)` — single Redis command.
-extern "C-unwind" fn command(state: LuaState) -> c_int {
-    command_impl(state, false)
+fn command(lua: &mut LuaStack<'_>) -> c_int {
+    command_impl(lua, false)
 }
-extern "C-unwind" fn exec_command(state: LuaState) -> c_int {
-    command_impl(state, true)
+fn exec_command(lua: &mut LuaStack<'_>) -> c_int {
+    command_impl(lua, true)
 }
 
-fn command_impl(state: LuaState, forget: bool) -> c_int {
-    let pool = laux::lua_touserdata::<RedisPool>(state, 1).expect("invalid redis pool pointer");
+fn command_impl(lua: &mut LuaStack<'_>, forget: bool) -> c_int {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<RedisPool>()
+        .expect("invalid redis pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
     let top = laux::lua_top(state);
     let nargs = (top - 1) as usize;
 
@@ -1056,7 +1067,7 @@ fn command_impl(state: LuaState, forget: bool) -> c_int {
     write_resp_array_header(&mut data, nargs);
 
     for i in 2..=top {
-        if let Err(e) = write_bulk_arg(&mut data, state, i) {
+        if let Err(e) = write_bulk_arg(&mut data, lua, i) {
             push_lua_table!(state, "code" => "ENCODE", "message" => format!("arg {}: {}", i - 1, e));
             return 1;
         }
@@ -1072,26 +1083,32 @@ fn command_impl(state: LuaState, forget: bool) -> c_int {
 /// `handle:pipeline(ops, resp_flag)` — pipelined commands.
 ///
 /// `ops` is `{ {"SET", "k", "v"}, {"GET", "k"}, ... }`.
-extern "C-unwind" fn pipeline(state: LuaState) -> c_int {
-    pipeline_impl(state, false)
+fn pipeline(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    pipeline_impl(lua, false)
 }
-extern "C-unwind" fn exec_pipeline(state: LuaState) -> c_int {
-    pipeline_impl(state, true)
+fn exec_pipeline(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    pipeline_impl(lua, true)
 }
 
-fn pipeline_impl(state: LuaState, forget: bool) -> c_int {
-    let pool = laux::lua_touserdata::<RedisPool>(state, 1).expect("invalid redis pool pointer");
+fn pipeline_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<RedisPool>()
+        .expect("invalid redis pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
     let ops_idx = laux::lua_absindex(state, 2);
-    laux::lua_checktype(state, ops_idx, ffi::LUA_TTABLE);
+    laux::lua_checktype(state, ops_idx, ffi::LUA_TTABLE)
+        .map_err(|err| format!("redis.pipeline: argument #2 {err}"))?;
 
     let n = unsafe { ffi::lua_rawlen(state.as_ptr(), ops_idx) } as usize;
     if n == 0 {
         push_lua_table!(state, "code" => "ENCODE", "message" => "pipeline: empty ops");
-        return 1;
+        return Ok(1);
     }
     if n > u32::MAX as usize {
         push_lua_table!(state, "code" => "ENCODE", "message" => format!("pipeline: too many commands ({})", n));
-        return 1;
+        return Ok(1);
     }
 
     let mut data = Vec::with_capacity(128);
@@ -1102,7 +1119,7 @@ fn pipeline_impl(state: LuaState, forget: bool) -> c_int {
         if laux::lua_type(state, cmd_idx) != laux::LuaType::Table {
             laux::lua_pop(state, 1);
             push_lua_table!(state, "code" => "ENCODE", "message" => format!("pipeline[{}]: expected table", i));
-            return 1;
+            return Ok(1);
         }
 
         let cmd_len = unsafe { ffi::lua_rawlen(state.as_ptr(), cmd_idx) } as usize;
@@ -1111,27 +1128,32 @@ fn pipeline_impl(state: LuaState, forget: bool) -> c_int {
 
         for j in 1..=cmd_len {
             unsafe { ffi::lua_rawgeti(state.as_ptr(), cmd_idx, j as ffi::lua_Integer) };
-            let result = write_bulk_arg(&mut data, state, laux::lua_top(state));
+            let result = write_bulk_arg(&mut data, lua, laux::lua_top(state));
             laux::lua_pop(state, 1);
             if let Err(e) = result {
                 laux::lua_pop(state, 1); // pop the command table
                 push_lua_table!(state, "code" => "ENCODE", "message" => format!("pipeline[{}][{}]: {}", i, j, e));
-                return 1;
+                return Ok(1);
             }
         }
 
         laux::lua_pop(state, 1);
     }
 
-    if forget {
+    Ok(if forget {
         dispatch_forget(state, pool, data, n as u32)
     } else {
         dispatch_async(state, pool, data, n as u32)
-    }
+    })
 }
 
-extern "C-unwind" fn pool_len(state: LuaState) -> c_int {
-    let pool = laux::lua_touserdata::<RedisPool>(state, 1).expect("invalid redis pool pointer");
+fn pool_len(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<RedisPool>()
+        .expect("invalid redis pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
     let table = LuaTable::new(state, pool.inner.workers().len(), 0);
     for w in pool.inner.workers() {
         table.push(w.counter().load());
@@ -1139,8 +1161,13 @@ extern "C-unwind" fn pool_len(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn close(state: LuaState) -> c_int {
-    let pool = laux::lua_touserdata::<RedisPool>(state, 1).expect("invalid redis pool pointer");
+fn close(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<RedisPool>()
+        .expect("invalid redis pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
     // Only remove our own entry: if a `connect()` with the same name has already
     // replaced this pool, closing through this (now stale) handle must not evict
     // the newer pool. Identify ourselves by the `inner` Arc.
@@ -1158,7 +1185,8 @@ extern "C-unwind" fn close(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn stats(state: LuaState) -> c_int {
+fn stats(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     let table = LuaTable::new(state, 0, REDIS_CONNECTIONS.len());
     REDIS_CONNECTIONS.iter().for_each(|pair| {
         let pool = &pair.value().inner;
@@ -1178,8 +1206,11 @@ extern "C-unwind" fn stats(state: LuaState) -> c_int {
 /// `redis.watch(url)` — dedicated pub/sub connection. Accepts the same
 /// `redis://...` URL as `connect` (the pool-only params like `name`/`pool_size`
 /// are ignored here).
-extern "C-unwind" fn watch_connect(state: LuaState) -> c_int {
-    let url = unsafe { laux::lua_check_str(state, 1) }.to_string();
+fn watch_connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let url = lua
+        .get::<String>(1)
+        .map_err(|err| format!("redis.watch: {err}"))?;
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -1223,51 +1254,76 @@ extern "C-unwind" fn watch_connect(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn watch_subscribe(state: LuaState) -> c_int {
-    let watch = laux::lua_touserdata::<RedisWatch>(state, 1).expect("invalid redis watch pointer");
-    let channels = collect_string_args(state, 2);
+fn watch_subscribe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let watch_ptr = lua
+        .value(1)
+        .as_userdata::<RedisWatch>()
+        .expect("invalid redis watch pointer");
+    let watch = unsafe { watch_ptr.as_ref() };
+    let channels = collect_string_args(lua, 2)?;
     match watch.send_op(WatchOp::Subscribe(channels)) {
         Ok(()) => laux::lua_push(state, true),
         Err(err) => push_lua_table!(state, "code" => "SOCKET", "message" => err.as_str()),
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn watch_psubscribe(state: LuaState) -> c_int {
-    let watch = laux::lua_touserdata::<RedisWatch>(state, 1).expect("invalid redis watch pointer");
-    let patterns = collect_string_args(state, 2);
+fn watch_psubscribe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let watch_ptr = lua
+        .value(1)
+        .as_userdata::<RedisWatch>()
+        .expect("invalid redis watch pointer");
+    let watch = unsafe { watch_ptr.as_ref() };
+    let patterns = collect_string_args(lua, 2)?;
     match watch.send_op(WatchOp::PSubscribe(patterns)) {
         Ok(()) => laux::lua_push(state, true),
         Err(err) => push_lua_table!(state, "code" => "SOCKET", "message" => err.as_str()),
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn watch_unsubscribe(state: LuaState) -> c_int {
-    let watch = laux::lua_touserdata::<RedisWatch>(state, 1).expect("invalid redis watch pointer");
-    let channels = collect_string_args(state, 2);
+fn watch_unsubscribe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let watch_ptr = lua
+        .value(1)
+        .as_userdata::<RedisWatch>()
+        .expect("invalid redis watch pointer");
+    let watch = unsafe { watch_ptr.as_ref() };
+    let channels = collect_string_args(lua, 2)?;
     match watch.send_op(WatchOp::Unsubscribe(channels)) {
         Ok(()) => laux::lua_push(state, true),
         Err(err) => push_lua_table!(state, "code" => "SOCKET", "message" => err.as_str()),
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn watch_punsubscribe(state: LuaState) -> c_int {
-    let watch = laux::lua_touserdata::<RedisWatch>(state, 1).expect("invalid redis watch pointer");
-    let patterns = collect_string_args(state, 2);
+fn watch_punsubscribe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let watch_ptr = lua
+        .value(1)
+        .as_userdata::<RedisWatch>()
+        .expect("invalid redis watch pointer");
+    let watch = unsafe { watch_ptr.as_ref() };
+    let patterns = collect_string_args(lua, 2)?;
     match watch.send_op(WatchOp::PUnsubscribe(patterns)) {
         Ok(()) => laux::lua_push(state, true),
         Err(err) => push_lua_table!(state, "code" => "SOCKET", "message" => err.as_str()),
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn watch_message(state: LuaState) -> c_int {
-    let watch = laux::lua_touserdata::<RedisWatch>(state, 1).expect("invalid redis watch pointer");
+fn watch_message(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let watch_ptr = lua
+        .value(1)
+        .as_userdata::<RedisWatch>()
+        .expect("invalid redis watch pointer");
+    let watch = unsafe { watch_ptr.as_ref() };
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
@@ -1278,8 +1334,13 @@ extern "C-unwind" fn watch_message(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn watch_close(state: LuaState) -> c_int {
-    let watch = laux::lua_touserdata::<RedisWatch>(state, 1).expect("invalid redis watch pointer");
+fn watch_close(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let watch_ptr = lua
+        .value(1)
+        .as_userdata::<RedisWatch>()
+        .expect("invalid redis watch pointer");
+    let watch = unsafe { watch_ptr.as_ref() };
     let _ = watch.send_op(WatchOp::Close);
     laux::lua_push(state, true);
     1
@@ -1287,10 +1348,10 @@ extern "C-unwind" fn watch_close(state: LuaState) -> c_int {
 
 fn push_watch_userdata(state: LuaState, watch: RedisWatch) {
     let methods = [
-        lreg!("subscribe", watch_subscribe),
-        lreg!("psubscribe", watch_psubscribe),
-        lreg!("unsubscribe", watch_unsubscribe),
-        lreg!("punsubscribe", watch_punsubscribe),
+        lreg_try!("subscribe", watch_subscribe),
+        lreg_try!("psubscribe", watch_psubscribe),
+        lreg_try!("unsubscribe", watch_unsubscribe),
+        lreg_try!("punsubscribe", watch_punsubscribe),
         lreg!("message", watch_message),
         lreg!("close", watch_close),
         lreg_null!(),
@@ -1403,7 +1464,7 @@ fn parse_raw_push(state: LuaState, raw: &[u8], pos: usize) -> Result<usize, Stri
                     count, MAX_ARRAY_COUNT
                 ));
             }
-            laux::lua_checkstack(state, 4, std::ptr::null());
+            laux::lua_checkstack(state, 4, std::ptr::null())?;
             let table = LuaTable::new(state, count, 0);
             let mut cur = next;
             for i in 0..count {
@@ -1475,15 +1536,15 @@ pub unsafe extern "C-unwind" fn decode_redis_message(
 ) -> c_int {
     match unsafe { crate::message_decode::take_boxed::<RedisResponse>(m) } {
         Ok(response) => push_redis_response(state, response),
-        Err(e) => crate::lua_push_error(state, &e),
+        Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
 
 pub extern "C-unwind" fn luaopen_redis(state: LuaState) -> c_int {
     let l = [
-        lreg!("connect", connect),
-        lreg!("find_connection", find_connection),
-        lreg!("watch", watch_connect),
+        lreg_try!("connect", connect),
+        lreg_try!("find_connection", find_connection),
+        lreg_try!("watch", watch_connect),
         lreg!("stats", stats),
         lreg_null!(),
     ];
@@ -1640,8 +1701,7 @@ mod tests {
     #[test]
     fn parse_url_password_only_and_max_connections_alias() {
         // Redis allows password without a username (`redis://:pass@host`).
-        let cfg =
-            ConnectConfig::parse("redis://:secret@localhost/1?max_connections=8").unwrap();
+        let cfg = ConnectConfig::parse("redis://:secret@localhost/1?max_connections=8").unwrap();
         assert!(cfg.params.username.is_empty());
         assert_eq!(cfg.params.password, "secret");
         assert_eq!(cfg.params.db, 1);
@@ -1656,8 +1716,7 @@ mod tests {
 
     #[test]
     fn parse_url_clamps_pool_and_queue() {
-        let cfg =
-            ConnectConfig::parse("redis://h/0?pool_size=0&queue_capacity=0").unwrap();
+        let cfg = ConnectConfig::parse("redis://h/0?pool_size=0&queue_capacity=0").unwrap();
         assert_eq!(cfg.pool_size, 1);
         assert_eq!(cfg.queue_capacity, 1);
     }

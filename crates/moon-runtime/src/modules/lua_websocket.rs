@@ -22,8 +22,8 @@ use tokio_tungstenite::{
 
 use moon_base::{
     cstr, ffi,
-    laux::{self, LuaState, LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib,
+    laux::{self, LuaStack, LuaState, LuaTable},
+    lreg_null, lreg_try, luaL_newlib,
 };
 use moon_runtime::{
     actor::LuaActor,
@@ -227,10 +227,14 @@ async fn on_server_accepted(
 
 // ---------- Connection userdata methods ----------
 
-extern "C-unwind" fn ws_read(state: LuaState) -> c_int {
-    let conn = laux::lua_touserdata::<WsChannel>(state, 1)
-        .unwrap_or_else(|| laux::lua_error(state, "invalid ws connection pointer".to_string()));
-    let read_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(5000);
+fn ws_read(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let conn_ptr = lua
+        .value(1)
+        .as_userdata::<WsChannel>()
+        .ok_or_else(|| "invalid ws connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
+    let read_timeout: u64 = lua.opt(2).unwrap_or(5000);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -242,7 +246,7 @@ extern "C-unwind" fn ws_read(state: LuaState) -> c_int {
     {
         Ok(_) => {
             laux::lua_push(state, session);
-            1
+            Ok(1)
         }
         Err(err) => {
             let _ = CONTEXT.send_value(
@@ -252,7 +256,7 @@ extern "C-unwind" fn ws_read(state: LuaState) -> c_int {
                 WsResponse::Error(format!("ws read error: {}", err)),
             );
             laux::lua_push(state, session);
-            1
+            Ok(1)
         }
     }
 }
@@ -269,16 +273,19 @@ fn to_message(data: Vec<u8>, kind: &str) -> Message {
     }
 }
 
-fn check_message(state: LuaState, index: i32, kind: &str) -> Message {
-    let data = match laux::lua_type(state, index) {
-        laux::LuaType::String => unsafe { laux::lua_check_lstring(state, index) }.to_vec(),
+fn check_message(lua: &LuaStack<'_>, index: i32, kind: &str) -> Result<Message, String> {
+    let value = lua.value(index);
+    let data = match value.kind() {
+        laux::LuaType::String => value.as_bytes().unwrap_or_default().to_vec(),
         laux::LuaType::LightUserData => {
-            let ptr = unsafe { ffi::lua_touserdata(state.as_ptr(), index) };
+            let ptr = value
+                .as_light_userdata()
+                .expect("lightuserdata type checked");
             if ptr.is_null() {
-                laux::lua_error(
-                    state,
-                    format!("bad argument #{} (non-null lightuserdata expected)", index),
-                );
+                return Err(format!(
+                    "bad argument #{} (non-null lightuserdata expected)",
+                    index
+                ));
             }
             // Take ownership of the heap `Buffer` created on the Lua side
             // (e.g. `buffer.concat` -> `Box::into_raw`). `to_vec` moves the
@@ -289,39 +296,50 @@ fn check_message(state: LuaState, index: i32, kind: &str) -> Message {
             buf.into_vec()
         }
         _ => {
-            laux::lua_error(
-                state,
-                format!(
-                    "bad argument #{} (string or lightuserdata expected, got {})",
-                    index,
-                    laux::type_name(state, index)
-                ),
-            );
+            return Err(format!(
+                "bad argument #{} (string or lightuserdata expected, got {})",
+                index,
+                value.name()
+            ));
         }
     };
-    to_message(data, kind)
+    Ok(to_message(data, kind))
 }
 
-extern "C-unwind" fn ws_write(state: LuaState) -> c_int {
-    let conn = laux::lua_touserdata::<WsChannel>(state, 1)
-        .unwrap_or_else(|| laux::lua_error(state, "invalid ws connection pointer".to_string()));
-    let kind = unsafe { laux::lua_check_str(state, 2) };
-    let msg = check_message(state, 3, kind);
+fn ws_write(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let conn_ptr = lua
+        .value(1)
+        .as_userdata::<WsChannel>()
+        .ok_or_else(|| "invalid ws connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
+    let kind = match lua.value(2).as_str() {
+        Some(kind) => kind,
+        None => return Err("bad argument #2 (valid UTF-8 string expected)".to_string()),
+    };
+    let msg = check_message(lua, 3, kind)?;
     let close = msg.is_close();
 
     match conn.tx_writer.try_send(WsRequest::Write(msg, close)) {
         Ok(_) => {
             laux::lua_push(state, true);
-            1
+            Ok(1)
         }
-        Err(err) => crate::lua_push_error(state, &format!("ws write error: {}", err)),
+        Err(err) => Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("ws write error: {}", err),
+        )),
     }
 }
 
-extern "C-unwind" fn ws_close(state: LuaState) -> c_int {
-    let conn = laux::lua_touserdata::<WsChannel>(state, 1)
-        .unwrap_or_else(|| laux::lua_error(state, "invalid ws connection pointer".to_string()));
-    let data = unsafe { laux::lua_opt_lstring(state, 2) }.unwrap_or_default();
+fn ws_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let conn_ptr = lua
+        .value(1)
+        .as_userdata::<WsChannel>()
+        .ok_or_else(|| "invalid ws connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
+    let data = lua.value(2).as_bytes().unwrap_or_default();
 
     match conn
         .tx_writer
@@ -331,9 +349,12 @@ extern "C-unwind" fn ws_close(state: LuaState) -> c_int {
         })))) {
         Ok(_) => {
             laux::lua_push(state, true);
-            1
+            Ok(1)
         }
-        Err(err) => crate::lua_push_error(state, &format!("ws close error: {}", err)),
+        Err(err) => Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("ws close error: {}", err),
+        )),
     }
 }
 
@@ -343,24 +364,24 @@ extern "C-unwind" fn ws_close(state: LuaState) -> c_int {
 /// uncapped (tungstenite's default incoming message limit is 64 MiB).
 const DEFAULT_WS_MESSAGE_CEILING: usize = 64 << 20;
 
-fn read_ws_config(state: LuaState, index: i32) -> WebSocketConfig {
+fn read_ws_config(lua: &mut LuaStack<'_>, index: i32) -> WebSocketConfig {
     let mut config = WebSocketConfig::default();
     // Reading fields off a non-table value would make `lua_getfield` raise, so
     // only consult the options table when one was actually provided. The
     // write-buffer bounding below still runs so the unbounded tungstenite
     // default never leaks through, even on the no-options path.
-    let has_opts = laux::lua_type(state, index) == laux::LuaType::Table;
+    let has_opts = lua.value(index).kind() == laux::LuaType::Table;
     let explicit_max_write_buffer = if has_opts {
-        if let Some(size) = laux::opt_field::<usize>(state, index, "max_message_size") {
+        if let Some(size) = lua.opt_field::<usize>(index, "max_message_size") {
             config.max_message_size = Some(size);
         }
-        if let Some(size) = laux::opt_field::<usize>(state, index, "max_frame_size") {
+        if let Some(size) = lua.opt_field::<usize>(index, "max_frame_size") {
             config.max_frame_size = Some(size);
         }
-        if let Some(size) = laux::opt_field::<usize>(state, index, "write_buffer_size") {
+        if let Some(size) = lua.opt_field::<usize>(index, "write_buffer_size") {
             config.write_buffer_size = size;
         }
-        laux::opt_field::<usize>(state, index, "max_write_buffer_size")
+        lua.opt_field::<usize>(index, "max_write_buffer_size")
     } else {
         None
     };
@@ -388,38 +409,31 @@ fn read_ws_config(state: LuaState, index: i32) -> WebSocketConfig {
 /// upgrades requests whose `Origin` header exactly matches an entry, which
 /// blocks cross-site WebSocket hijacking from browsers. When absent, no Origin
 /// check is performed (suitable for non-browser / trusted clients).
-fn read_allowed_origins(state: LuaState, index: i32) -> Option<Arc<Vec<String>>> {
-    unsafe {
-        ffi::lua_getfield(state.as_ptr(), index, cstr!("origins"));
-        let result = if laux::lua_type(state, -1) == laux::LuaType::Table {
-            let top = laux::lua_top(state);
-            let table = LuaTable::from_stack(state, top);
-            let mut origins = Vec::new();
-            for val in table.array_iter() {
-                if let LuaValue::String(s) = val {
-                    origins.push(String::from_utf8_lossy(s).into_owned());
-                }
-            }
-            if origins.is_empty() {
-                None
-            } else {
-                Some(Arc::new(origins))
-            }
-        } else {
-            None
-        };
-        ffi::lua_pop(state.as_ptr(), 1);
-        result
+fn read_allowed_origins(lua: &mut LuaStack<'_>, index: i32) -> Option<Arc<Vec<String>>> {
+    let cursor = lua.table_field_cursor(index, "origins")?;
+    let mut origins = Vec::new();
+    for entry in cursor {
+        let value = entry.value();
+        if let Some(origin) = value.as_str() {
+            origins.push(origin.to_owned());
+        }
+    }
+    if origins.is_empty() {
+        None
+    } else {
+        Some(Arc::new(origins))
     }
 }
 
-extern "C-unwind" fn ws_connect(state: LuaState) -> c_int {
-    laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
+fn ws_connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    laux::lua_checktype(state, 1, ffi::LUA_TTABLE)
+        .map_err(|err| format!("websocket.connect: argument #1 {err}"))?;
 
-    let url: String = laux::opt_field(state, 1, "url").unwrap_or_default();
-    let connect_timeout: u64 = laux::opt_field(state, 1, "connect_timeout").unwrap_or(5000);
+    let url: String = lua.opt_field(1, "url").unwrap_or_default();
+    let connect_timeout: u64 = lua.opt_field(1, "connect_timeout").unwrap_or(5000);
 
-    let ws_config = read_ws_config(state, 1);
+    let ws_config = read_ws_config(lua, 1);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -457,48 +471,62 @@ extern "C-unwind" fn ws_connect(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
 // The handshake callback's `Err` type (`ErrorResponse`) is fixed by
 // tungstenite's `Callback` trait, so the large-err lint is unavoidable here.
 #[allow(clippy::result_large_err)]
-extern "C-unwind" fn ws_listen(state: LuaState) -> c_int {
+fn ws_listen(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     let _guard = CONTEXT.io_runtime().enter();
-
-    let addr = unsafe { laux::lua_check_str(state, 1) };
 
     let has_opts = laux::lua_type(state, 2) == laux::LuaType::Table;
     // `read_ws_config` is safe to call even without an options table and always
     // bounds `max_write_buffer_size`, so don't fall back to the raw default
     // (which leaves the write buffer unbounded).
-    let ws_config = read_ws_config(state, 2);
+    let ws_config = read_ws_config(lua, 2);
     let allowed_origins = if has_opts {
-        read_allowed_origins(state, 2)
+        read_allowed_origins(lua, 2)
     } else {
         None
     };
     let max_connections: usize = if has_opts {
-        laux::opt_field(state, 2, "max_connections").unwrap_or(LIMITS.listener_connections)
+        lua.opt_field(2, "max_connections")
+            .unwrap_or(LIMITS.listener_connections)
     } else {
         LIMITS.listener_connections
+    };
+
+    let addr = match lua.value(1).as_str() {
+        Some(addr) => addr,
+        None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
     };
 
     let listener = match std::net::TcpListener::bind(addr) {
         Ok(l) => l,
         Err(err) => {
-            return crate::lua_push_error(state, &format!("ws listen '{}' failed: {}", addr, err));
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("ws listen '{}' failed: {}", addr, err),
+            ));
         }
     };
 
     if let Err(err) = listener.set_nonblocking(true) {
-        return crate::lua_push_error(state, &format!("ws listen '{}' failed: {}", addr, err));
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("ws listen '{}' failed: {}", addr, err),
+        ));
     }
 
     let listener = match TcpListener::from_std(listener) {
         Ok(l) => l,
         Err(err) => {
-            return crate::lua_push_error(state, &format!("ws listen '{}' failed: {}", addr, err));
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("ws listen '{}' failed: {}", addr, err),
+            ));
         }
     };
 
@@ -608,11 +636,12 @@ extern "C-unwind" fn ws_listen(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, fd);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn ws_accept(state: LuaState) -> c_int {
-    let fd: i64 = laux::lua_get(state, 1);
+fn ws_accept(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let fd: i64 = lua.get(1)?;
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
@@ -622,23 +651,30 @@ extern "C-unwind" fn ws_accept(state: LuaState) -> c_int {
             .tx_reader
             .try_send(WsRequest::Accept(owner, session))
         {
-            return crate::lua_push_error(state, &format!("ws accept error: {}", err));
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("ws accept error: {}", err),
+            ));
         }
     } else {
-        return crate::lua_push_error(state, &format!("ws: fd {} not found", fd));
+        return Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("ws: fd {} not found", fd),
+        ));
     }
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn ws_find_connection(state: LuaState) -> c_int {
-    let id: i64 = laux::lua_get(state, 1);
+fn ws_find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let id: i64 = lua.get(1)?;
     match WS_NET.get(&id) {
         Some(pair) => {
             let l = [
-                lreg!("read", ws_read),
-                lreg!("write", ws_write),
-                lreg!("close", ws_close),
+                lreg_try!("read", ws_read),
+                lreg_try!("write", ws_write),
+                lreg_try!("close", ws_close),
                 lreg_null!(),
             ];
             if laux::lua_newuserdata(
@@ -650,14 +686,14 @@ extern "C-unwind" fn ws_find_connection(state: LuaState) -> c_int {
             .is_none()
             {
                 laux::lua_pushnil(state);
-                return 1;
+                return Ok(1);
             }
         }
         None => {
             laux::lua_pushnil(state);
         }
     }
-    1
+    Ok(1)
 }
 
 fn version_to_string(version: &tokio_tungstenite::tungstenite::http::Version) -> &'static str {
@@ -718,7 +754,7 @@ fn push_ws_response(state: LuaState, response: WsResponse) -> c_int {
             laux::lua_push(state, kind);
             2
         }
-        WsResponse::Error(err) => crate::lua_push_error(state, err.as_str()),
+        WsResponse::Error(err) => crate::lua_push_error_tuple(state, err.as_str()),
     }
 }
 
@@ -728,16 +764,16 @@ pub unsafe extern "C-unwind" fn decode_websocket_message(
 ) -> c_int {
     match unsafe { crate::message_decode::take_boxed::<WsResponse>(m) } {
         Ok(response) => push_ws_response(state, response),
-        Err(e) => crate::lua_push_error(state, &e),
+        Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
 
 pub extern "C-unwind" fn luaopen_websocket(state: LuaState) -> c_int {
     let l = [
-        lreg!("connect", ws_connect),
-        lreg!("listen", ws_listen),
-        lreg!("accept", ws_accept),
-        lreg!("find_connection", ws_find_connection),
+        lreg_try!("connect", ws_connect),
+        lreg_try!("listen", ws_listen),
+        lreg_try!("accept", ws_accept),
+        lreg_try!("find_connection", ws_find_connection),
         lreg_null!(),
     ];
 

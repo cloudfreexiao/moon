@@ -40,12 +40,12 @@
 //! random jitter (1000..=10000) so externally observed ids do not reveal a fixed
 //! stride.
 
-use moon_base::{cstr, ffi, laux, lreg, lreg_null, luaL_newlib};
+use moon_base::{cstr, ffi, laux, lreg, lreg_null, lreg_try, luaL_newlib};
 use rand::RngExt;
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use moon_base::laux::LuaState;
+use moon_base::laux::{LuaStack, LuaState};
 
 // ---- UUID (type != 0): type(10) | serverid(16) | sequence(37) ----
 // type lives in the high bits so that `type == 0` (=> player UID) is detectable
@@ -114,27 +114,25 @@ static UUID_STATE: UuidState = UuidState {
     sequence: [const { AtomicI64::new(0) }; (TYPE_MAX + 1) as usize],
 };
 
-extern "C-unwind" fn linit(state: LuaState) -> c_int {
-    let channel = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 1) } as i64;
-    let serverid = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 2) } as i64;
+fn linit(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let channel: i64 = lua.get(1).map_err(|err| format!("uuid.init: {err}"))?;
+    let serverid: i64 = lua.get(2).map_err(|err| format!("uuid.init: {err}"))?;
     // arg 3: persisted sequence table (may be empty / nil). Each entry is the
     // previously-dumped counter for the corresponding type (index 1 = type 0).
     let has_table = unsafe { ffi::lua_type(state.as_ptr(), 3) } == ffi::LUA_TTABLE;
 
     if !(channel > 0 && channel <= UID_CHANNEL_MAX) {
-        laux::lua_error(
-            state,
-            format!("uuid.init: channel out of limit (1..={})", UID_CHANNEL_MAX),
-        );
+        return Err(format!(
+            "uuid.init: channel out of limit (1..={})",
+            UID_CHANNEL_MAX
+        ));
     }
     if !(serverid > 0 && serverid <= SERVERID_MAX) {
-        laux::lua_error(
-            state,
-            format!(
-                "uuid.init: serverid out of limit (1..={})",
-                SERVERID_MAX
-            ),
-        );
+        return Err(format!(
+            "uuid.init: serverid out of limit (1..={})",
+            SERVERID_MAX
+        ));
     }
 
     // Seed the counters first, then publish `serverid` last (Release, below) so
@@ -142,14 +140,11 @@ extern "C-unwind" fn linit(state: LuaState) -> c_int {
     if has_table {
         let len = unsafe { ffi::lua_rawlen(state.as_ptr(), 3) } as i64;
         if len != 0 && len != TYPE_MAX + 1 {
-            laux::lua_error(
-                state,
-                format!(
-                    "uuid.init: sequence table size error, expected 0 or {}, got {}",
-                    TYPE_MAX + 1,
-                    len
-                ),
-            );
+            return Err(format!(
+                "uuid.init: sequence table size error, expected 0 or {}, got {}",
+                TYPE_MAX + 1,
+                len
+            ));
         }
 
         if len > 0 {
@@ -159,13 +154,20 @@ extern "C-unwind" fn linit(state: LuaState) -> c_int {
             for i in 0..len {
                 unsafe {
                     ffi::lua_rawgeti(state.as_ptr(), 3, (i + 1) as ffi::lua_Integer);
-                    let stored = ffi::luaL_checkinteger(state.as_ptr(), -1) as i64;
+                    let stored: i64 = lua
+                        .get(-1)
+                        .map_err(|err| format!("uuid.init: sequence value {i}: {err}"))?;
                     ffi::lua_pop(state.as_ptr(), 1);
-                    let jitter = rng.random_range(SEQUENCE_INIT_JITTER_MIN..=SEQUENCE_INIT_JITTER_MAX);
+                    let jitter =
+                        rng.random_range(SEQUENCE_INIT_JITTER_MIN..=SEQUENCE_INIT_JITTER_MAX);
                     // Clamp to the valid range for this type. Index 0 is the
                     // player-UID counter, which is capped at UID_SEQUENCE_MAX
                     // (24 bits) rather than the 37-bit UUID cap.
-                    let cap = if i == 0 { UID_SEQUENCE_MAX } else { SEQUENCE_MAX };
+                    let cap = if i == 0 {
+                        UID_SEQUENCE_MAX
+                    } else {
+                        SEQUENCE_MAX
+                    };
                     let start = stored.saturating_add(jitter).min(cap);
                     UUID_STATE.sequence[i as usize].store(start, Ordering::Relaxed);
                 }
@@ -189,7 +191,7 @@ extern "C-unwind" fn linit(state: LuaState) -> c_int {
     UUID_STATE.channel.store(channel, Ordering::Relaxed);
     UUID_STATE.serverid.store(serverid, Ordering::Release);
 
-    0
+    Ok(0)
 }
 
 /// Atomically hand out the next value from `slot`, refusing once `max` has
@@ -202,19 +204,16 @@ fn issue_next(slot: &AtomicI64, max: i64) -> Option<i64> {
         if current > max {
             return None;
         }
-        match slot.compare_exchange_weak(
-            current,
-            current + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match slot.compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => return Some(current),
             Err(actual) => current = actual,
         }
     }
 }
 
-extern "C-unwind" fn lnext(state: LuaState) -> c_int {
+fn lnext(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     // `serverid` is published last (Release) by `init`; loading it Acquire here
     // means that once we observe a non-zero serverid, every counter/channel
     // store from `init` is guaranteed visible even across threads. Callers must
@@ -222,27 +221,23 @@ extern "C-unwind" fn lnext(state: LuaState) -> c_int {
     let serverid = UUID_STATE.serverid.load(Ordering::Acquire);
     let channel = UUID_STATE.channel.load(Ordering::Relaxed);
     if serverid == 0 || channel == 0 {
-        laux::lua_error(state, "uuid.next: not init".to_string());
+        return Err("uuid.next: not init".to_string());
     }
 
     let typ = unsafe { ffi::luaL_optinteger(state.as_ptr(), 1, 0) } as i64;
     if !(0..=TYPE_MAX).contains(&typ) {
-        laux::lua_error(
-            state,
-            format!("uuid.next: type out of limit (0..={})", TYPE_MAX),
-        );
+        return Err(format!("uuid.next: type out of limit (0..={})", TYPE_MAX));
     }
 
     if typ == 0 {
         // Player UID: channel(8) | serverid(16) | sequence(24).
         let Some(sequence) = issue_next(&UUID_STATE.sequence[0], UID_SEQUENCE_MAX) else {
-            laux::lua_error(state, "uuid.next: player uid sequence out of limit".to_string());
+            return Err("uuid.next: player uid sequence out of limit".to_string());
         };
-        let v = (channel << UID_CHANNEL_LEFT_SHIFT)
-            | (serverid << UID_SERVERID_LEFT_SHIFT)
-            | sequence;
+        let v =
+            (channel << UID_CHANNEL_LEFT_SHIFT) | (serverid << UID_SERVERID_LEFT_SHIFT) | sequence;
         laux::lua_push(state, v as ffi::lua_Integer);
-        1
+        Ok(1)
     } else {
         // UUID: type(10) | serverid(16) | sequence(37).
         // An explicit sequence may be supplied as arg #2; otherwise advance the
@@ -253,53 +248,51 @@ extern "C-unwind" fn lnext(state: LuaState) -> c_int {
             // would OR high bits into the result and corrupt the type/serverid
             // fields (or set the sign bit), so range-check both ends.
             if !(0..=SEQUENCE_MAX).contains(&explicit) {
-                laux::lua_error(state, "uuid.next: sequence out of limit".to_string());
+                return Err("uuid.next: sequence out of limit".to_string());
             }
             explicit
         } else {
             let Some(seq) = issue_next(&UUID_STATE.sequence[typ as usize], SEQUENCE_MAX) else {
-                laux::lua_error(state, "uuid.next: sequence out of limit".to_string());
+                return Err("uuid.next: sequence out of limit".to_string());
             };
             seq
         };
 
-        let v = (typ << TYPE_LEFT_SHIFT)
-            | (serverid << SERVERID_LEFT_SHIFT)
-            | sequence;
+        let v = (typ << TYPE_LEFT_SHIFT) | (serverid << SERVERID_LEFT_SHIFT) | sequence;
         laux::lua_push(state, v as ffi::lua_Integer);
-        1
+        Ok(1)
     }
 }
 
-extern "C-unwind" fn ltype(state: LuaState) -> c_int {
-    let uuid = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 1) } as i64;
+fn ltype(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let uuid: i64 = lua.get(1).map_err(|err| format!("uuid.type: {err}"))?;
     // `(uuid >> TYPE_LEFT_SHIFT) == 0` means it is a player UID, not a UUID.
     if (uuid >> TYPE_LEFT_SHIFT) == 0 {
-        laux::lua_error(
-            state,
-            "uuid.type: attempt to get type from a non-uuid value".to_string(),
-        );
+        return Err("uuid.type: attempt to get type from a non-uuid value".to_string());
     }
     laux::lua_push(
         state,
         ((uuid >> TYPE_LEFT_SHIFT) & TYPE_MAX) as ffi::lua_Integer,
     );
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn lis_uid(state: LuaState) -> c_int {
-    let uuid = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 1) } as i64;
+fn lis_uid(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let uuid: i64 = lua.get(1).map_err(|err| format!("uuid.is_uid: {err}"))?;
     // A player UID has type == 0 (high bits clear) and every field populated.
     let is_uid = (uuid >> TYPE_LEFT_SHIFT) == 0
         && (uuid & UID_SEQUENCE_MAX) != 0
         && ((uuid >> UID_SERVERID_LEFT_SHIFT) & UID_SERVERID_MAX) != 0
         && ((uuid >> UID_CHANNEL_LEFT_SHIFT) & UID_CHANNEL_MAX) != 0;
     laux::lua_push(state, is_uid);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn lserverid(state: LuaState) -> c_int {
-    let uuid = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 1) } as i64;
+fn lserverid(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let uuid: i64 = lua.get(1).map_err(|err| format!("uuid.serverid: {err}"))?;
     let serverid = if (uuid >> TYPE_LEFT_SHIFT) == 0 {
         // Player UID.
         (uuid >> UID_SERVERID_LEFT_SHIFT) & UID_SERVERID_MAX
@@ -308,7 +301,7 @@ extern "C-unwind" fn lserverid(state: LuaState) -> c_int {
         (uuid >> SERVERID_LEFT_SHIFT) & SERVERID_MAX
     };
     laux::lua_push(state, serverid as ffi::lua_Integer);
-    1
+    Ok(1)
 }
 
 /// `split(value)` → `type, serverid, sequence, channel`.
@@ -316,8 +309,9 @@ extern "C-unwind" fn lserverid(state: LuaState) -> c_int {
 /// Decodes an id into its component fields, dispatching on the kind. The first
 /// three returns are always meaningful; `channel` is the player-UID channel for
 /// a player UID (`type == 0`) and `0` for a UUID (which has no channel field).
-extern "C-unwind" fn lsplit(state: LuaState) -> c_int {
-    let value = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 1) } as i64;
+fn lsplit(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let value: i64 = lua.get(1).map_err(|err| format!("uuid.split: {err}"))?;
     let (typ, serverid, sequence, channel) = if (value >> TYPE_LEFT_SHIFT) == 0 {
         // Player UID: channel(8) | serverid(16) | sequence(24).
         (
@@ -339,7 +333,7 @@ extern "C-unwind" fn lsplit(state: LuaState) -> c_int {
     laux::lua_push(state, serverid as ffi::lua_Integer);
     laux::lua_push(state, sequence as ffi::lua_Integer);
     laux::lua_push(state, channel as ffi::lua_Integer);
-    4
+    Ok(4)
 }
 
 /// `dump(periodic)`.
@@ -351,7 +345,8 @@ extern "C-unwind" fn lsplit(state: LuaState) -> c_int {
 /// When `periodic` is truthy, each reported sequence is `counter +
 /// SEQUENCE_SAVE_MARGIN` (clamped) so a crash after the save cannot reissue ids.
 /// When falsy, the real counter is reported (use on clean shutdown).
-extern "C-unwind" fn ldump(state: LuaState) -> c_int {
+fn ldump(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     let periodic = unsafe { ffi::lua_toboolean(state.as_ptr(), 1) } != 0;
 
     let table = laux::LuaTable::new(state, (TYPE_MAX + 1) as usize, 0);
@@ -390,12 +385,12 @@ extern "C-unwind" fn ldump(state: LuaState) -> c_int {
 
 pub unsafe extern "C-unwind" fn luaopen_uuid(state: LuaState) -> c_int {
     let l = [
-        lreg!("init", linit),
-        lreg!("next", lnext),
-        lreg!("type", ltype),
-        lreg!("is_uid", lis_uid),
-        lreg!("serverid", lserverid),
-        lreg!("split", lsplit),
+        lreg_try!("init", linit),
+        lreg_try!("next", lnext),
+        lreg_try!("type", ltype),
+        lreg_try!("is_uid", lis_uid),
+        lreg_try!("serverid", lserverid),
+        lreg_try!("split", lsplit),
         lreg!("dump", ldump),
         lreg_null!(),
     ];

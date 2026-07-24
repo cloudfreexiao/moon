@@ -315,9 +315,10 @@ fn build_and_install(
     // Locally-vendored (`path`) extensions already use a path dependency, so no
     // patch is needed.
     if spec.path.is_none() {
-        let moon_base_git = manifest.moon_base_git.as_deref().ok_or(
-            "`moon_base_git` must be set in extensions.toml for git-based extensions",
-        )?;
+        let moon_base_git = manifest
+            .moon_base_git
+            .as_deref()
+            .ok_or("`moon_base_git` must be set in extensions.toml for git-based extensions")?;
         let local_moon_base = repo_root.join(MOON_BASE_CRATE);
         let patch = format!(
             "patch.\"{}\".moon-base.path=\"{}\"",
@@ -417,8 +418,8 @@ fn select(manifest: &Manifest, names: &[String]) -> Result<Vec<(String, ExtSpec)
 
 fn load_manifest(repo_root: &Path) -> Result<Manifest> {
     let path = repo_root.join(MANIFEST_FILE);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     Ok(toml::from_str(&text).map_err(|e| format!("parsing {MANIFEST_FILE}: {e}"))?)
 }
 

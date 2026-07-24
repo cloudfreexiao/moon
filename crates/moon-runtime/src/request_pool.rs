@@ -98,13 +98,7 @@ impl PendingCounter {
 /// `{ pending, total, peak, workers }`. For pooled drivers (redis/pg) the
 /// values are summed across workers, so `peak` is the sum of per-worker
 /// high-water marks (an upper bound on true simultaneous peak).
-pub(crate) fn push_pool_stats(
-    state: LuaState,
-    pending: i64,
-    total: i64,
-    peak: i64,
-    workers: i64,
-) {
+pub(crate) fn push_pool_stats(state: LuaState, pending: i64, total: i64, peak: i64, workers: i64) {
     let t = LuaTable::new(state, 0, 4);
     t.insert("pending", pending);
     t.insert("total", total);
@@ -194,7 +188,10 @@ impl<M> WorkerSet<M> {
                 worker.counter.inc();
                 Ok(())
             }
-            Err(err) => Err(format!("{}: failed to send message to worker: {}", self.name, err)),
+            Err(err) => Err(format!(
+                "{}: failed to send message to worker: {}",
+                self.name, err
+            )),
         }
     }
 

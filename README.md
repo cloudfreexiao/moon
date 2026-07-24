@@ -110,6 +110,7 @@ You can trim the binary or enable modules selectively with standard Cargo featur
 - Examples: `assets/example/`
 - Benchmarks: `assets/benchmark/`
 - Test scripts: `assets/test/`
+- Rust Lua binding guide: [`docs/laux.md`](docs/laux.md)
 - Module docs: `docs/socket.md`, `docs/httpc.md`, `docs/httpd.md`, `docs/redis.md`, `docs/pg.md`, `docs/sqlx.md`, `docs/mongodb.md`, `docs/cluster.md`
 
 ## Status

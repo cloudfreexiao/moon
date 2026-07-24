@@ -7,7 +7,7 @@ extern crate self as moon_runtime;
 
 use moon_base::{
     cstr, ffi,
-    laux::{self, LuaState, LuaValue},
+    laux::{self, LuaStack, LuaState, LuaType},
 };
 use std::ffi::c_int;
 use std::sync::Arc;
@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 pub mod actor;
 // `Buffer` lives in the shared `moon-base` crate; re-export it so the
 // long-standing `moon_runtime::buffer` path keeps working.
-pub use moon_base::buffer;
 use buffer::Buffer;
+pub use moon_base::buffer;
 pub mod context;
 pub mod error;
 pub mod loader;
@@ -61,75 +61,89 @@ impl<const N: usize> ShortBytes<N> {
 
 #[inline]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn check_buffer(state: LuaState, index: i32) -> Box<Buffer> {
-    match LuaValue::from_stack(state, index) {
-        LuaValue::String(s) => Box::new(Buffer::from(s)),
-        LuaValue::LightUserData(ptr) => unsafe {
+pub fn check_buffer(lua: &LuaStack<'_>, index: i32) -> Result<Box<Buffer>, String> {
+    let value = lua.value(index);
+    match value.kind() {
+        LuaType::String => Ok(Box::new(Buffer::from(value.as_bytes().unwrap_or_default()))),
+        LuaType::LightUserData => unsafe {
+            let Some(ptr) = value.as_light_userdata() else {
+                return Err(format!(
+                    "bad argument #{} (buffer expected, got null pointer)",
+                    index
+                ));
+            };
             if ptr.is_null() {
-                laux::lua_error(
-                    state,
-                    format!(
-                        "bad argument #{} (buffer expected, got null pointer)",
-                        index
-                    ),
-                );
+                return Err(format!(
+                    "bad argument #{} (buffer expected, got null pointer)",
+                    index
+                ));
             }
-            Box::from_raw(ptr as *mut Buffer)
+            Ok(Box::from_raw(ptr.cast::<Buffer>()))
         },
-        _ => {
-            laux::lua_error(
-                state,
-                format!(
-                    "bad argument #{} (buffer expected, got {})",
-                    index,
-                    laux::type_name(state, index)
-                ),
-            );
-        }
+        _ => Err(format!(
+            "bad argument #{} (buffer expected, got {})",
+            index,
+            value.name()
+        )),
     }
 }
 
 #[inline]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn check_arc_buffer(state: LuaState, index: i32) -> Arc<Buffer> {
-    match LuaValue::from_stack(state, index) {
-        LuaValue::String(s) => Arc::new(Buffer::from(s)),
-        LuaValue::LightUserData(ptr) => unsafe {
+pub fn check_arc_buffer(lua: &LuaStack<'_>, index: i32) -> Result<Arc<Buffer>, String> {
+    let value = lua.value(index);
+    match value.kind() {
+        LuaType::String => Ok(Arc::new(Buffer::from(value.as_bytes().unwrap_or_default()))),
+        LuaType::LightUserData => unsafe {
+            let Some(ptr) = value.as_light_userdata() else {
+                return Err(format!(
+                    "bad argument #{} (buffer expected, got null pointer)",
+                    index
+                ));
+            };
             if ptr.is_null() {
-                laux::lua_error(
-                    state,
-                    format!(
-                        "bad argument #{} (buffer expected, got null pointer)",
-                        index
-                    ),
-                );
+                return Err(format!(
+                    "bad argument #{} (buffer expected, got null pointer)",
+                    index
+                ));
             }
-            Arc::from(Box::from_raw(ptr as *mut Buffer))
+            Ok(Arc::from(Box::from_raw(ptr.cast::<Buffer>())))
         },
-        LuaValue::UserData(ptr) => unsafe {
-            if ptr.is_null() {
-                laux::lua_error(
-                    state,
-                    format!(
-                        "bad argument #{} (buffer expected, got null pointer)",
-                        index
-                    ),
-                );
-            }
-            let arc = &*(ptr as *const Arc<Buffer>);
-            arc.clone()
+        LuaType::UserData => unsafe {
+            let ptr = value.as_userdata::<Arc<Buffer>>();
+            let Some(ptr) = ptr else {
+                return Err(format!(
+                    "bad argument #{} (buffer expected, got null pointer)",
+                    index
+                ));
+            };
+            Ok(ptr.as_ref().clone())
         },
-        _ => {
-            laux::lua_error(
-                state,
-                format!(
-                    "bad argument #{} (buffer expected, got {})",
-                    index,
-                    laux::type_name(state, index)
-                ),
-            );
-        }
+        _ => Err(format!(
+            "bad argument #{} (buffer expected, got {})",
+            index,
+            value.name()
+        )),
     }
+}
+
+/// Borrows a valid UTF-8 string from a Lua stack slot, or returns an argument-indexed error.
+pub(crate) fn checked_str<'ctx>(lua: &'ctx LuaStack<'_>, index: i32) -> Result<&'ctx str, String> {
+    let value = lua.value(index);
+    value
+        .as_str()
+        .ok_or_else(|| format!("bad argument #{index} (valid UTF-8 string expected)"))
+}
+
+/// Borrows raw bytes from a Lua stack slot, or returns an argument-indexed error.
+pub(crate) fn checked_bytes<'ctx>(
+    lua: &'ctx LuaStack<'_>,
+    index: i32,
+) -> Result<&'ctx [u8], String> {
+    let value = lua.value(index);
+    value
+        .as_bytes()
+        .ok_or_else(|| format!("bad argument #{index} (string expected)"))
 }
 
 pub fn escape_print(input: &[u8]) -> String {
@@ -192,6 +206,8 @@ mod lua_random;
 #[cfg(feature = "redis")]
 #[path = "modules/lua_redis.rs"]
 mod lua_redis;
+#[path = "modules/lua_schema.rs"]
+mod lua_schema;
 #[path = "modules/lua_seri.rs"]
 mod lua_seri;
 #[path = "modules/lua_socket.rs"]
@@ -203,13 +219,11 @@ mod lua_sqlx;
 mod lua_utils;
 #[path = "modules/lua_uuid.rs"]
 mod lua_uuid;
-#[path = "modules/lua_zset.rs"]
-mod lua_zset;
-#[path = "modules/lua_schema.rs"]
-mod lua_schema;
 #[cfg(feature = "websocket")]
 #[path = "modules/lua_websocket.rs"]
 mod lua_websocket;
+#[path = "modules/lua_zset.rs"]
+mod lua_zset;
 mod message_decode;
 mod request_pool;
 
@@ -408,7 +422,7 @@ pub fn next_net_fd() -> i64 {
 }
 
 /// Unified Lua error return: pushes `(false, errmsg)` and returns 2.
-pub fn lua_push_error(state: LuaState, msg: &str) -> c_int {
+pub fn lua_push_error_tuple(state: LuaState, msg: &str) -> c_int {
     laux::lua_push(state, false);
     laux::lua_push(state, msg);
     2
@@ -513,10 +527,8 @@ pub(crate) static DECODERS: LazyLock<[message_decode::MessageDecodeFn; 256]> =
     LazyLock::new(build_decoders);
 
 fn build_decoders() -> [message_decode::MessageDecodeFn; 256] {
-    use moon_runtime::context::{
-        PTYPE_DEBUG, PTYPE_ERROR, PTYPE_INTEGER, PTYPE_LUA, PTYPE_SOCKET_EVENT, PTYPE_SOCKET_TCP,
-        PTYPE_TEXT, PTYPE_TIMER,
-    };
+    #[cfg(feature = "grpc")]
+    use moon_runtime::context::PTYPE_GRPC;
     #[cfg(feature = "httpc")]
     use moon_runtime::context::PTYPE_HTTPC;
     #[cfg(feature = "httpd")]
@@ -527,12 +539,14 @@ fn build_decoders() -> [message_decode::MessageDecodeFn; 256] {
     use moon_runtime::context::PTYPE_PG;
     #[cfg(feature = "redis")]
     use moon_runtime::context::PTYPE_REDIS;
-    #[cfg(feature = "grpc")]
-    use moon_runtime::context::PTYPE_GRPC;
     #[cfg(feature = "sqlx")]
     use moon_runtime::context::PTYPE_SQLX;
     #[cfg(feature = "websocket")]
     use moon_runtime::context::PTYPE_WEBSOCKET;
+    use moon_runtime::context::{
+        PTYPE_DEBUG, PTYPE_ERROR, PTYPE_INTEGER, PTYPE_LUA, PTYPE_SOCKET_EVENT, PTYPE_SOCKET_TCP,
+        PTYPE_TEXT, PTYPE_TIMER,
+    };
 
     let mut decoders: [message_decode::MessageDecodeFn; 256] =
         [message_decode::default_decode as message_decode::MessageDecodeFn; 256];
@@ -600,6 +614,7 @@ mod tests {
             lua_require!(state, "json", lua_json::luaopen_json);
             lua_require!(state, "buffer", lua_buffer::luaopen_buffer);
             lua_require!(state, "seri", lua_seri::luaopen_seri);
+            lua_require!(state, "schema", lua_schema::luaopen_schema);
             lua_require!(state, "utils", lua_utils::luaopen_utils);
             (state, guard)
         }
@@ -646,6 +661,40 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["a"], 1);
         assert_eq!(v["b"], "hello");
+    }
+
+    #[test]
+    fn schema_cursor_validation_handles_nested_arrays_and_objects() {
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local schema = require("schema")
+            schema.load {
+                Item = {
+                    id = { value_type = "int32" },
+                    tags = { container = "array", value_type = "string" },
+                },
+                Root = {
+                    child = { value_type = "Item" },
+                    scores = { container = "array", value_type = "int64" },
+                    items = { container = "object", key_type = "int32", value_type = "Item" },
+                },
+            }
+            schema.validate("Root", {
+                child = { id = 1, tags = { "a", "b" } },
+                scores = { 10, 20, 30 },
+                items = { [2] = { id = 3, tags = {} } },
+            })
+            local ok, err = pcall(function()
+                schema.validate("Root", {
+                    child = { id = 1.5, tags = {} },
+                    scores = { 10 },
+                    items = {},
+                })
+            end)
+            assert(not ok)
+            assert(string.find(err, "trace: Root.child.id", 1, true))
+        "#;
+        run_lua(state, code).expect("schema cursor validation failed");
     }
 
     #[test]
@@ -751,6 +800,23 @@ mod tests {
     }
 
     #[test]
+    fn json_boolean_options_preserve_lua_truthiness() {
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local json = require("json")
+            local old = json.options("enable_number_key", false)
+            assert(old == true)
+
+            old = json.options("enable_number_key", 0)
+            assert(old == false)
+
+            old = json.options("enable_number_key", nil)
+            assert(old == true)
+        "#;
+        run_lua(state, code).expect("json option truthiness changed");
+    }
+
+    #[test]
     fn json_object_empty_encodes_as_object() {
         let (state, _guard) = new_lua_vm();
         let result = run_lua_expr(state, r#"require("json").encode(require("json").object())"#);
@@ -790,6 +856,48 @@ mod tests {
             assert(s == '["a","b"]', "expected array encoding, got: " .. s)
         "#;
         run_lua(state, code).expect("json array with data failed");
+    }
+
+    #[test]
+    fn json_concat_and_resp_preserve_encoded_payloads() {
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local json = require("json")
+            local buffer = require("buffer")
+
+            local ptr = json.concat({"a", 2, true, {x = 1}})
+            local data = buffer.read(ptr, buffer.size(ptr))
+            assert(data == 'a2true{"x":1}', "json.concat payload mismatch: " .. data)
+            buffer.drop(ptr)
+
+            local resp_ptr, hash = json.concat_resp("SET", "key", "value")
+            assert(type(hash) == "number", "RESP hash must be numeric")
+            local resp = buffer.read(resp_ptr, buffer.size(resp_ptr))
+            assert(resp == "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
+                "json.concat_resp payload mismatch: " .. resp)
+            buffer.drop(resp_ptr)
+        "#;
+        run_lua(state, code).expect("JSON concatenation payload regression");
+    }
+
+    #[test]
+    fn json_concat_error_cleans_the_cursor_before_the_next_call() {
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local json = require("json")
+            local buffer = require("buffer")
+
+            local ok, err = pcall(json.concat, {"prefix", function() end})
+            assert(not ok, "unsupported nested value must fail")
+            assert(err:find("json.concat: unsupport value type", 1, true), tostring(err))
+
+            local binary = string.char(0, 255, 1)
+            local ptr = json.concat({binary, {value = 7}})
+            local data = buffer.read(ptr, buffer.size(ptr))
+            assert(data == binary .. '{"value":7}', "call after cursor error was corrupted")
+            buffer.drop(ptr)
+        "#;
+        run_lua(state, code).expect("JSON cursor error cleanup regression");
     }
 
     #[test]
@@ -882,6 +990,108 @@ mod tests {
         run_lua(state, code).expect("json deep nested arrays failed");
     }
 
+    #[cfg(feature = "httpc")]
+    #[test]
+    fn httpc_parsers_borrow_lua_input() {
+        let (state, _guard) = new_lua_vm();
+        lua_require!(state, "httpc.core", lua_httpc::luaopen_httpc);
+        let code = r#"
+            local httpc = require("httpc.core")
+            local response = httpc.parse_response(
+                "HTTP/1.1 201 Created\r\nX-Test: value\r\n\r\n")
+            assert(response.version == "1.1")
+            assert(response.status_code == 201)
+            assert(response.headers["x-test"] == "value")
+
+            local request = httpc.parse_request(
+                "GET /items?q=1 HTTP/1.1\r\nHost: example\r\n\r\n")
+            assert(request.method == "GET")
+            assert(request.path == "/items")
+            assert(request.query_string == "q=1")
+            assert(request.headers.host == "example")
+        "#;
+        run_lua(state, code).expect("httpc parser borrow test failed");
+    }
+
+    #[cfg(feature = "httpc")]
+    #[test]
+    fn httpc_parser_failures_remain_return_values() {
+        let (state, _guard) = new_lua_vm();
+        lua_require!(state, "httpc.core", lua_httpc::luaopen_httpc);
+        let code = r#"
+            local httpc = require("httpc.core")
+
+            local ok, value, err = pcall(httpc.parse_response, "")
+            assert(ok and value == false, tostring(err))
+            assert(err:find("Invalid HTTP version", 1, true), err)
+
+            ok, value, err = pcall(httpc.parse_request, "GET")
+            assert(ok and value == false, tostring(err))
+            assert(err:find("Incomplete request", 1, true), err)
+        "#;
+        run_lua(state, code).expect("httpc parser error return contract changed");
+    }
+
+    #[test]
+    fn socket_sync_failures_remain_return_values() {
+        let (state, _guard) = new_lua_vm();
+        lua_require!(state, "net.core", lua_socket::luaopen_socket);
+        let code = r#"
+            local socket = require("net.core")
+            local missing_fd = 0x7fffffffffffffff
+
+            local ok, value, err = pcall(socket.read, missing_fd, 1)
+            assert(ok and value == false, tostring(err))
+            assert(err:find("not found", 1, true), err)
+
+            ok, value, err = pcall(socket.read, missing_fd, "")
+            assert(ok and value == false, tostring(err))
+            assert(err:find("delim is empty", 1, true), err)
+        "#;
+        run_lua(state, code).expect("socket error return contract changed");
+    }
+
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn grpc_connect_validation_remains_a_return_value() {
+        let (state, _guard) = new_lua_vm();
+        lua_require!(state, "grpc.core", lua_grpc::luaopen_grpc);
+        let code = r#"
+            local grpc = require("grpc.core")
+            local ok, value, err = pcall(grpc.connect, {})
+            assert(ok and value == false, tostring(err))
+            assert(err:find("endpoint", 1, true), err)
+        "#;
+        run_lua(state, code).expect("grpc error return contract changed");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_listen_failure_remains_a_return_value() {
+        let (state, _guard) = new_lua_vm();
+        lua_require!(state, "ws.core", lua_websocket::luaopen_websocket);
+        let code = r#"
+            local ws = require("ws.core")
+            local ok, value, err = pcall(ws.listen, "not-a-socket-address")
+            assert(ok and value == false, tostring(err))
+            assert(err:find("ws listen", 1, true), err)
+        "#;
+        run_lua(state, code).expect("websocket error return contract changed");
+    }
+
+    #[cfg(feature = "excel")]
+    #[test]
+    fn excel_unsupported_type_remains_a_return_value() {
+        let (state, _guard) = new_lua_vm();
+        lua_require!(state, "excel", lua_excel::luaopen_excel);
+        let code = r#"
+            local excel = require("excel")
+            local ok, value, err = pcall(excel.read, "data.unsupported")
+            assert(ok and value == false, tostring(err))
+            assert(err:find("unsupport file type", 1, true), err)
+        "#;
+        run_lua(state, code).expect("excel error return contract changed");
+    }
 
     // ========================= PG protocol (json.pq_*) tests =========================
 
@@ -927,6 +1137,21 @@ mod tests {
             assert(v == nil)
         "#;
         run_lua(state, code).expect("seri pack/unpack nil failed");
+    }
+
+    #[test]
+    fn seri_unpack_malformed_stream_returns_error() {
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local seri = require("seri")
+            local ok, err = pcall(function()
+                return seri.unpack(string.char(6))
+            end)
+            assert(not ok, "malformed stream should fail")
+            assert(string.find(err, "Invalid serialize stream", 1, true),
+                "missing malformed stream error: " .. tostring(err))
+        "#;
+        run_lua(state, code).expect("seri malformed stream error test failed");
     }
 
     #[test]
@@ -1101,6 +1326,19 @@ mod tests {
     }
 
     #[test]
+    fn buffer_concat_uses_lifetime_array_cursor() {
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local buffer = require("buffer")
+            local ptr = buffer.concat({"a", {"b", 3}, true})
+            local value = buffer.unpack(ptr, "Z")
+            assert(value == "ab3true", "nested concat mismatch: " .. tostring(value))
+            buffer.drop(ptr)
+        "#;
+        run_lua(state, code).expect("buffer nested concat failed");
+    }
+
+    #[test]
     fn buffer_seek() {
         let (state, _guard) = new_lua_vm();
         let code = r#"
@@ -1113,6 +1351,31 @@ mod tests {
             buffer.drop(buf)
         "#;
         run_lua(state, code).expect("buffer seek test failed");
+    }
+
+    #[test]
+    fn buffer_result_callbacks_report_lua_errors() {
+        let (state, _guard) = new_lua_vm();
+        let code = r#"
+            local buffer = require("buffer")
+
+            local function invalid_concat()
+                return buffer.concat(function() end)
+            end
+            local ok, err = pcall(invalid_concat)
+            assert(not ok and err:find("unsupport type", 1, true), tostring(err))
+            assert(err:match(":%d+: buffer%.concat"), "missing Lua source location: " .. tostring(err))
+
+            ok, err = pcall(buffer.write, nil, "data")
+            assert(not ok and err:find("invalid `Buffer` pointer", 1, true), tostring(err))
+
+            ok, err = pcall(buffer.drop, nil)
+            assert(not ok and err:find("invalid `Buffer` pointer", 1, true), tostring(err))
+
+            ok, err = pcall(buffer.write, {}, "data")
+            assert(not ok and err:find("invalid `Buffer` pointer", 1, true), tostring(err))
+        "#;
+        run_lua(state, code).expect("buffer Result callback error propagation failed");
     }
 
     // ========================= Message decoder tests =========================
