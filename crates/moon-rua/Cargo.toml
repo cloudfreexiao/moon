@@ -12,4 +12,4 @@ doctest = false
 [dependencies]
 moon-runtime = { workspace = true }
 ruac = { workspace = true }
-rua-resources = { workspace = true }
+rua-common = { workspace = true }

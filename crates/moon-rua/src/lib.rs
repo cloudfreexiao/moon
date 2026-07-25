@@ -1,7 +1,7 @@
 //! In-process Rua compilation, module loading and traceback rendering.
 
 use moon_runtime::loader::{LuaChunk, LuaErrorContext, LuaErrorReporter, LuaModuleLoader};
-use rua_resources::embedded_std;
+use rua_common::embedded_std;
 use ruac::{
     artifact::{bundle_sidecar_path, modules_manifest_path, read_manifest, source_hash},
     codegen::{GeneratedLuaModule, GeneratedLuaModules, LuaSourceMapping},
