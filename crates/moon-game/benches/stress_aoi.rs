@@ -16,9 +16,7 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
-use moon_game::aoi::{
-    Aoi, ENABLE_LEAVE_EVENT, FIXED as F, Handle, MARKER as M, WATCHER as W,
-};
+use moon_game::aoi::{Aoi, ENABLE_LEAVE_EVENT, FIXED as F, Handle, MARKER as M, WATCHER as W};
 use moon_game::math::{Rect, Vec2};
 
 const WM: i32 = W | M;
@@ -75,10 +73,28 @@ fn bench(c: &mut Criterion) {
             || (Aoi::new(0, 0, 10000, 100), Rng::new(42)),
             |(mut aoi, mut rng)| {
                 for i in 0..1000 {
-                    ins(&mut aoi, i, rng.range(10000), rng.range(10000), 200, 200, 0, W);
+                    ins(
+                        &mut aoi,
+                        i,
+                        rng.range(10000),
+                        rng.range(10000),
+                        200,
+                        200,
+                        0,
+                        W,
+                    );
                 }
                 for i in 0..5000 {
-                    ins(&mut aoi, 10000 + i, rng.range(10000), rng.range(10000), 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        10000 + i,
+                        rng.range(10000),
+                        rng.range(10000),
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                 }
                 black_box(aoi.size());
                 aoi // returned so criterion drops it *outside* the timed region
@@ -115,10 +131,28 @@ fn bench(c: &mut Criterion) {
                 aoi.set_option(ENABLE_LEAVE_EVENT);
                 let mut rng = Rng::new(123);
                 for i in 0..200 {
-                    ins(&mut aoi, i, rng.range(5000), rng.range(5000), 400, 400, 0, W);
+                    ins(
+                        &mut aoi,
+                        i,
+                        rng.range(5000),
+                        rng.range(5000),
+                        400,
+                        400,
+                        0,
+                        W,
+                    );
                 }
                 for i in 0..1000 {
-                    ins(&mut aoi, 10000 + i, rng.range(5000), rng.range(5000), 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        10000 + i,
+                        rng.range(5000),
+                        rng.range(5000),
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                 }
                 (aoi, rng)
             },
@@ -147,7 +181,16 @@ fn bench(c: &mut Criterion) {
                 let mut aoi = Aoi::new(0, 0, 1000, 50);
                 aoi.set_option(ENABLE_LEAVE_EVENT);
                 for i in 0..200i32 {
-                    ins(&mut aoi, (1000 + i) as i64, (i * 47) % 1000, (i * 71) % 1000, 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        (1000 + i) as i64,
+                        (i * 47) % 1000,
+                        (i * 71) % 1000,
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                 }
                 ins(&mut aoi, 1, 0, 0, 200, 200, 0, W);
                 aoi
@@ -186,7 +229,16 @@ fn bench(c: &mut Criterion) {
                 for i in 0..10000i32 {
                     let id = 50000i64 + i as i64;
                     aoi.clear_event();
-                    ins(&mut aoi, id, 1000 + (i % 100) - 50, 1000 + (i % 100) - 50, 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        id,
+                        1000 + (i % 100) - 50,
+                        1000 + (i % 100) - 50,
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                     aoi.erase(id, true);
                 }
                 black_box(aoi.size());
@@ -204,7 +256,16 @@ fn bench(c: &mut Criterion) {
                 let mut aoi = Aoi::new(0, 0, 2000, 50);
                 aoi.set_option(ENABLE_LEAVE_EVENT);
                 for i in 1..=100i32 {
-                    ins(&mut aoi, i as i64, 1000 + (i % 10) * 5, 1000 + (i / 10) * 5, 600, 600, 0, W);
+                    ins(
+                        &mut aoi,
+                        i as i64,
+                        1000 + (i % 10) * 5,
+                        1000 + (i / 10) * 5,
+                        600,
+                        600,
+                        0,
+                        W,
+                    );
                 }
                 ins(&mut aoi, 500, 1000, 1000, 0, 0, 0, M);
                 aoi
@@ -231,10 +292,28 @@ fn bench(c: &mut Criterion) {
                 let mut aoi = Aoi::new(0, 0, 10000, 100);
                 aoi.set_option(ENABLE_LEAVE_EVENT);
                 for i in 1..=200i32 {
-                    ins(&mut aoi, i as i64, 500 + (i % 20) * 25, 500 + (i / 20) * 25, 300, 300, 0, WM);
+                    ins(
+                        &mut aoi,
+                        i as i64,
+                        500 + (i % 20) * 25,
+                        500 + (i / 20) * 25,
+                        300,
+                        300,
+                        0,
+                        WM,
+                    );
                 }
                 for i in 0..50i32 {
-                    ins(&mut aoi, (5000 + i) as i64, 3000 + i * 100, 5000, 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        (5000 + i) as i64,
+                        3000 + i * 100,
+                        5000,
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                 }
                 aoi
             },
@@ -245,7 +324,14 @@ fn bench(c: &mut Criterion) {
                 }
                 for i in 1..=50i32 {
                     aoi.clear_event();
-                    aoi.update(i as i64, 500 + (i % 20) * 25, 500 + (i / 20) * 25, 300, 300, 0);
+                    aoi.update(
+                        i as i64,
+                        500 + (i % 20) * 25,
+                        500 + (i / 20) * 25,
+                        300,
+                        300,
+                        0,
+                    );
                 }
                 black_box(aoi.size());
                 aoi // returned so criterion drops it *outside* the timed region
@@ -264,7 +350,16 @@ fn bench(c: &mut Criterion) {
                     ins(&mut aoi, i, 2500, 2500, 1000, 1000, 0, W);
                 }
                 for i in 0..500i32 {
-                    ins(&mut aoi, (1000 + i) as i64, 2000 + (i % 50) * 20, 2000 + (i / 50) * 20, 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        (1000 + i) as i64,
+                        2000 + (i % 50) * 20,
+                        2000 + (i / 50) * 20,
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                 }
                 aoi
             },
@@ -324,7 +419,16 @@ fn bench(c: &mut Criterion) {
             || {
                 let mut aoi = Aoi::new(0, 0, 10000, 100);
                 for i in 0..5000i32 {
-                    ins(&mut aoi, i as i64, (i * 73) % 10000, (i * 137) % 10000, 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        i as i64,
+                        (i * 73) % 10000,
+                        (i * 137) % 10000,
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                 }
                 (aoi, Rng::new(99))
             },
@@ -361,7 +465,16 @@ fn bench(c: &mut Criterion) {
                 let mut aoi = Aoi::new(0, 0, 5000, 100);
                 let mut rng = Rng::new(77);
                 for i in 0..200 {
-                    ins(&mut aoi, i, 100 + rng.range(4800), 100 + rng.range(4800), 30, 30, 0, MF);
+                    ins(
+                        &mut aoi,
+                        i,
+                        100 + rng.range(4800),
+                        100 + rng.range(4800),
+                        30,
+                        30,
+                        0,
+                        MF,
+                    );
                 }
                 (aoi, rng)
             },
@@ -426,7 +539,16 @@ fn bench(c: &mut Criterion) {
                 aoi.set_option(ENABLE_LEAVE_EVENT);
                 let mut rng = Rng::new(256);
                 for i in 1..=100 {
-                    ins(&mut aoi, i, rng.range(5000), rng.range(5000), 300, 300, 0, WM);
+                    ins(
+                        &mut aoi,
+                        i,
+                        rng.range(5000),
+                        rng.range(5000),
+                        300,
+                        300,
+                        0,
+                        WM,
+                    );
                 }
                 (aoi, rng)
             },
@@ -510,7 +632,14 @@ fn bench(c: &mut Criterion) {
                         } else {
                             (100 + i * 30 + (100 - tick) * 20, 100 + (100 - tick) * 20)
                         };
-                        aoi.update((1000 + i) as i64, clampi(x, 0, 1999), clampi(y, 0, 1999), 0, 0, 0);
+                        aoi.update(
+                            (1000 + i) as i64,
+                            clampi(x, 0, 1999),
+                            clampi(y, 0, 1999),
+                            0,
+                            0,
+                            0,
+                        );
                     }
                 }
                 aoi.clear_event();
@@ -556,7 +685,16 @@ fn bench(c: &mut Criterion) {
             |mut aoi| {
                 for _round in 0..20 {
                     for i in 0..200i32 {
-                        ins(&mut aoi, i as i64, (i * 37) % 2000, (i * 71) % 2000, 200, 200, 0, WM);
+                        ins(
+                            &mut aoi,
+                            i as i64,
+                            (i * 37) % 2000,
+                            (i * 71) % 2000,
+                            200,
+                            200,
+                            0,
+                            WM,
+                        );
                     }
                     aoi.clear();
                 }
@@ -576,7 +714,16 @@ fn bench(c: &mut Criterion) {
                 aoi.set_option(ENABLE_LEAVE_EVENT);
                 let mut rng = Rng::new(999);
                 for i in 0..300 {
-                    ins(&mut aoi, i, rng.range(5000), rng.range(5000), 300, 300, 0, WM);
+                    ins(
+                        &mut aoi,
+                        i,
+                        rng.range(5000),
+                        rng.range(5000),
+                        300,
+                        300,
+                        0,
+                        WM,
+                    );
                 }
                 (aoi, rng)
             },
@@ -601,25 +748,58 @@ fn bench(c: &mut Criterion) {
             || {
                 let mut aoi = Aoi::new(0, 0, 5000, 100);
                 for i in 0..500i32 {
-                    ins(&mut aoi, i as i64, (i * 41) % 5000, (i * 67) % 5000, 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        i as i64,
+                        (i * 41) % 5000,
+                        (i * 67) % 5000,
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                 }
                 for i in 500..700i32 {
-                    ins(&mut aoi, i as i64, (i * 31) % 5000, (i * 53) % 5000, 200, 200, 0, W);
+                    ins(
+                        &mut aoi,
+                        i as i64,
+                        (i * 31) % 5000,
+                        (i * 53) % 5000,
+                        200,
+                        200,
+                        0,
+                        W,
+                    );
                 }
                 for i in 700..800i32 {
-                    ins(&mut aoi, i as i64, (i * 23) % 5000, (i * 47) % 5000, 200, 200, 0, WM);
+                    ins(
+                        &mut aoi,
+                        i as i64,
+                        (i * 23) % 5000,
+                        (i * 47) % 5000,
+                        200,
+                        200,
+                        0,
+                        WM,
+                    );
                 }
                 aoi
             },
             |aoi| {
                 let mut markers: HashSet<Handle> = HashSet::new();
                 let mut watchers: HashSet<Handle> = HashSet::new();
-                aoi.for_each_all(|h, _, _, _, _| {
-                    markers.insert(h);
-                }, M);
-                aoi.for_each_all(|h, _, _, _, _| {
-                    watchers.insert(h);
-                }, W);
+                aoi.for_each_all(
+                    |h, _, _, _, _| {
+                        markers.insert(h);
+                    },
+                    M,
+                );
+                aoi.for_each_all(
+                    |h, _, _, _, _| {
+                        watchers.insert(h);
+                    },
+                    W,
+                );
                 black_box(markers.len() + watchers.len());
                 aoi // returned so criterion drops it *outside* the timed region
             },
@@ -639,7 +819,16 @@ fn bench(c: &mut Criterion) {
             |mut aoi| {
                 aoi.clear_event();
                 for i in 0..1000i32 {
-                    ins(&mut aoi, (2000 + i) as i64, i % 2000, (i * 3) % 2000, 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        (2000 + i) as i64,
+                        i % 2000,
+                        (i * 3) % 2000,
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                 }
                 aoi.set_option(ENABLE_LEAVE_EVENT);
                 aoi.clear_event();
@@ -661,10 +850,28 @@ fn bench(c: &mut Criterion) {
                 let mut aoi = Aoi::new(0, 0, 5000, 100);
                 aoi.set_option(ENABLE_LEAVE_EVENT);
                 for i in 0..100i32 {
-                    ins(&mut aoi, i as i64, 2500, 2500, 50 + i * 10, 50 + i * 10, 0, W);
+                    ins(
+                        &mut aoi,
+                        i as i64,
+                        2500,
+                        2500,
+                        50 + i * 10,
+                        50 + i * 10,
+                        0,
+                        W,
+                    );
                 }
                 for i in 0..200i32 {
-                    ins(&mut aoi, (1000 + i) as i64, 2000 + (i * 17) % 1000, 2000 + (i * 31) % 1000, 0, 0, 0, M);
+                    ins(
+                        &mut aoi,
+                        (1000 + i) as i64,
+                        2000 + (i * 17) % 1000,
+                        2000 + (i * 31) % 1000,
+                        0,
+                        0,
+                        0,
+                        M,
+                    );
                 }
                 (aoi, Rng::new(88))
             },
@@ -739,7 +946,16 @@ fn bench(c: &mut Criterion) {
                 aoi.set_option(ENABLE_LEAVE_EVENT);
                 let mut rng = Rng::new(314);
                 for i in 0..200 {
-                    ins(&mut aoi, i, -5000 + rng.range(10000), -5000 + rng.range(10000), 300, 300, 0, WM);
+                    ins(
+                        &mut aoi,
+                        i,
+                        -5000 + rng.range(10000),
+                        -5000 + rng.range(10000),
+                        300,
+                        300,
+                        0,
+                        WM,
+                    );
                 }
                 (aoi, rng)
             },

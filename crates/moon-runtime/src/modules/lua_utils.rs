@@ -1,15 +1,15 @@
 use base64::{Engine, engine};
 use moon_base::{
     self, cstr, ffi,
-    laux::{self, LuaState},
-    lreg, lreg_null, luaL_newlib,
+    laux::{self, LuaStack, LuaState},
+    lreg_null, lreg_try, luaL_newlib,
 };
 use sha2::digest::DynDigest;
 use std::{ffi::c_int, time::Duration};
 
-pub extern "C-unwind" fn num_cpus(state: LuaState) -> c_int {
-    laux::lua_push(state, num_cpus::get());
-    1
+fn num_cpus(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    lua.push(num_cpus::get());
+    Ok(1)
 }
 
 // Dynamic hash function
@@ -41,50 +41,47 @@ fn to_hex_string(bytes: &[u8]) -> String {
     s
 }
 
-pub extern "C-unwind" fn hash(state: LuaState) -> c_int {
-    let hasher_type = unsafe { laux::lua_check_str(state, 1) };
-    let data = unsafe { laux::lua_check_lstring(state, 2) };
+fn hash(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let hasher_type = crate::checked_str(lua, 1)?;
+    let data = crate::checked_bytes(lua, 2)?;
     if let Some(mut hasher) = select_hasher(hasher_type) {
         let res = use_hasher(&mut *hasher, data);
-        laux::lua_push(state, to_hex_string(res.as_ref()).as_str());
-        return 1;
+        lua.push(to_hex_string(res.as_ref()));
+        return Ok(1);
     }
 
-    laux::lua_error(state, format!("unsupported hasher {}", hasher_type));
+    Err(format!("unsupported hasher {}", hasher_type))
 }
 
-pub extern "C-unwind" fn thread_sleep(state: LuaState) -> c_int {
-    let ms: u64 = laux::lua_get(state, 1);
-    std::thread::sleep(Duration::from_millis(ms as u64));
-    0
+fn thread_sleep(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let ms: u64 = lua.get(1)?;
+    std::thread::sleep(Duration::from_millis(ms));
+    Ok(0)
 }
 
-pub extern "C-unwind" fn base64_encode(state: LuaState) -> c_int {
-    let data = unsafe { laux::lua_check_lstring(state, 1) };
+fn base64_encode(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let data = crate::checked_bytes(lua, 1)?;
     let base64_string = engine::general_purpose::STANDARD.encode(data);
-    laux::lua_push(state, base64_string);
-    1
+    lua.push(base64_string);
+    Ok(1)
 }
 
-pub extern "C-unwind" fn base64_decode(state: LuaState) -> c_int {
-    let base64_string = unsafe { laux::lua_check_str(state, 1) };
-    let data = engine::general_purpose::STANDARD.decode(base64_string);
-    if data.is_err() {
-        laux::lua_push(state, data.clone().unwrap_err().to_string());
-        drop(data);
-        laux::throw_error(state);
-    }
-    laux::lua_push(state, data.unwrap().as_slice());
-    1
+fn base64_decode(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let base64_string = crate::checked_str(lua, 1)?;
+    let data = engine::general_purpose::STANDARD
+        .decode(base64_string)
+        .map_err(|error| error.to_string())?;
+    lua.push(data);
+    Ok(1)
 }
 
 pub extern "C-unwind" fn luaopen_utils(state: LuaState) -> c_int {
     let l = [
-        lreg!("num_cpus", num_cpus),
-        lreg!("hash", hash),
-        lreg!("thread_sleep", thread_sleep),
-        lreg!("base64_encode", base64_encode),
-        lreg!("base64_decode", base64_decode),
+        lreg_try!("num_cpus", num_cpus),
+        lreg_try!("hash", hash),
+        lreg_try!("thread_sleep", thread_sleep),
+        lreg_try!("base64_encode", base64_encode),
+        lreg_try!("base64_decode", base64_decode),
         lreg_null!(),
     ];
 

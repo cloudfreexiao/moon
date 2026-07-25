@@ -13,12 +13,12 @@
 //! the structure itself. The span-based O(log N) rank logic mirrors the original
 //! (and Redis) skiplist.
 
-use moon_base::laux::LuaState;
-use moon_base::{cstr, ffi, laux, lreg, lreg_null, luaL_newlib};
+use crate::hash::FxBuildHasher;
+use moon_base::laux::{LuaStack, LuaState};
+use moon_base::{cstr, ffi, laux, lreg_null, lreg_try, luaL_newlib};
 use rand::RngExt;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int};
-use crate::hash::FxBuildHasher;
 
 const MAXLEVEL: usize = 32;
 const NIL: u32 = u32::MAX;
@@ -262,7 +262,11 @@ impl SkipList {
 
         let mut x = self.header;
         for idx in (0..self.level).rev() {
-            rank[idx] = if idx == self.level - 1 { 0 } else { rank[idx + 1] };
+            rank[idx] = if idx == self.level - 1 {
+                0
+            } else {
+                rank[idx + 1]
+            };
             loop {
                 let lv = self.lvl(x, idx);
                 if lv.forward != NIL && self.score_of(lv.forward).lt(&score) {
@@ -294,14 +298,22 @@ impl SkipList {
             let upd_lv = self.lvl(upd, i);
             let crossed = rank[0] - rank[i];
             // x takes update[i]'s old forward; update[i] now points to x.
-            self.set_level(x, i, Level {
-                forward: upd_lv.forward,
-                span: upd_lv.span - crossed,
-            });
-            self.set_level(upd, i, Level {
-                forward: x,
-                span: crossed + 1,
-            });
+            self.set_level(
+                x,
+                i,
+                Level {
+                    forward: upd_lv.forward,
+                    span: upd_lv.span - crossed,
+                },
+            );
+            self.set_level(
+                upd,
+                i,
+                Level {
+                    forward: x,
+                    span: crossed + 1,
+                },
+            );
         }
 
         for (i, &upd) in update.iter().enumerate().take(self.level).skip(level) {
@@ -669,142 +681,163 @@ impl ZSet {
 ///
 /// These methods are only reachable through the zset's own metatable
 /// `__index`, so argument 1 is always a zset userdata. We therefore skip the
-/// per-call `luaL_checkudata` metatable string-compare and read the pointer
-/// directly (same approach as `lua_redis.rs`), erroring only on a null pointer.
-fn get_zset(state: LuaState, index: i32) -> &'static mut ZSet {
-    laux::lua_touserdata::<ZSet>(state, index)
-        .unwrap_or_else(|| laux::lua_error(state, "zset: expected zset userdata".to_string()))
+/// per-call type/metatable checks and read the pointer directly (same approach
+/// as the original FFI implementation and `lua_redis.rs`).
+///
+/// # Safety
+/// `index` must be the zset userdata receiver installed by `create`.
+#[inline(always)]
+unsafe fn get_zset(lua: &LuaStack<'_>, index: i32) -> std::ptr::NonNull<ZSet> {
+    unsafe { lua.userdata_ptr_unchecked(index) }
 }
 
-extern "C-unwind" fn update(state: LuaState) -> c_int {
-    let zset = get_zset(state, 1);
-    let key = laux::lua_get::<i64>(state, 2);
-    let score = laux::lua_get::<i64>(state, 3);
-    let timestamp = laux::lua_get::<i64>(state, 4);
+fn update(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let mut zset_ptr = unsafe { get_zset(lua, 1) };
+    let zset = unsafe { zset_ptr.as_mut() };
+    let key = lua.get::<i64>(2)?;
+    let score = lua.get::<i64>(3)?;
+    let timestamp = lua.get::<i64>(4)?;
     if score == i64::MIN {
-        laux::lua_error(
-            state,
+        return Err(
             "zset: score cannot be i64::MIN (negation overflow in reverse mode)".to_string(),
         );
     }
     zset.update(key, score, timestamp);
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn rank(state: LuaState) -> c_int {
-    let zset = get_zset(state, 1);
-    let key = laux::lua_get::<i64>(state, 2);
+fn rank(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut zset_ptr = unsafe { get_zset(lua, 1) };
+    let zset = unsafe { zset_ptr.as_mut() };
+    let key = lua.get::<i64>(2)?;
     let v = zset.rank(key);
     if v > 0 {
         laux::lua_push(state, v as ffi::lua_Integer);
-        1
+        Ok(1)
     } else {
-        0
+        Ok(0)
     }
 }
 
-extern "C-unwind" fn key_by_rank(state: LuaState) -> c_int {
-    let zset = get_zset(state, 1);
-    let rank = laux::lua_get::<i64>(state, 2);
+fn key_by_rank(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut zset_ptr = unsafe { get_zset(lua, 1) };
+    let zset = unsafe { zset_ptr.as_mut() };
+    let rank = lua.get::<i64>(2)?;
     if rank <= 0 {
-        return 0;
+        return Ok(0);
     }
     match zset.key_by_rank(rank as usize) {
         Some(key) => {
             laux::lua_push(state, key as ffi::lua_Integer);
-            1
+            Ok(1)
         }
-        None => 0,
+        None => Ok(0),
     }
 }
 
-extern "C-unwind" fn score(state: LuaState) -> c_int {
-    let zset = get_zset(state, 1);
-    let key = laux::lua_get::<i64>(state, 2);
+fn score(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut zset_ptr = unsafe { get_zset(lua, 1) };
+    let zset = unsafe { zset_ptr.as_mut() };
+    let key = lua.get::<i64>(2)?;
     laux::lua_push(state, zset.score(key) as ffi::lua_Integer);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn has(state: LuaState) -> c_int {
-    let zset = get_zset(state, 1);
-    let key = laux::lua_get::<i64>(state, 2);
+fn has(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut zset_ptr = unsafe { get_zset(lua, 1) };
+    let zset = unsafe { zset_ptr.as_mut() };
+    let key = lua.get::<i64>(2)?;
     laux::lua_push(state, zset.has(key));
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn size(state: LuaState) -> c_int {
-    let zset = get_zset(state, 1);
+fn size(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut zset_ptr = unsafe { get_zset(lua, 1) };
+    let zset = unsafe { zset_ptr.as_mut() };
     laux::lua_push(state, zset.size() as ffi::lua_Integer);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn clear(state: LuaState) -> c_int {
-    let zset = get_zset(state, 1);
+fn clear(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let mut zset_ptr = unsafe { get_zset(lua, 1) };
+    let zset = unsafe { zset_ptr.as_mut() };
     zset.clear();
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn erase(state: LuaState) -> c_int {
-    let zset = get_zset(state, 1);
-    let key = laux::lua_get::<i64>(state, 2);
+fn erase(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut zset_ptr = unsafe { get_zset(lua, 1) };
+    let zset = unsafe { zset_ptr.as_mut() };
+    let key = lua.get::<i64>(2)?;
     laux::lua_push(state, zset.erase(key) as ffi::lua_Integer);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn range(state: LuaState) -> c_int {
-    let zset = get_zset(state, 1);
-    let start = laux::lua_get::<i64>(state, 2);
-    let stop = laux::lua_get::<i64>(state, 3);
-    let reverse = laux::lua_opt::<bool>(state, 4).unwrap_or(false);
+fn range(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut zset_ptr = unsafe { get_zset(lua, 1) };
+    let zset = unsafe { zset_ptr.as_mut() };
+    let start = lua.get::<i64>(2)?;
+    let stop = lua.get::<i64>(3)?;
+    let reverse = lua.opt_truthy(4).unwrap_or(false);
 
     match zset.range(start, stop, reverse) {
-        Ok(None) => 0,
+        Ok(None) => Ok(0),
         Ok(Some(keys)) => {
             let table = laux::LuaTable::new(state, keys.len(), 0);
             for (i, key) in keys.into_iter().enumerate() {
                 laux::lua_push(state, key as ffi::lua_Integer);
                 table.rawseti(i + 1);
             }
-            1
+            Ok(1)
         }
-        Err(rangelen) => laux::lua_error(
-            state,
-            format!(
-                "zset.range: range length exceeds maximum supported size (requested={}, max={})",
-                rangelen, MAX_RANGE_LEN
-            ),
-        ),
+        Err(rangelen) => Err(format!(
+            "zset.range: range length exceeds maximum supported size (requested={}, max={})",
+            rangelen, MAX_RANGE_LEN
+        )),
     }
 }
 
-extern "C-unwind" fn create(state: LuaState) -> c_int {
-    let max_count = laux::lua_get::<i64>(state, 1);
+fn create(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let max_count = lua.get::<i64>(1)?;
     let max_count = if max_count < 0 { 0 } else { max_count as usize };
-    let reverse = laux::lua_opt::<bool>(state, 2).unwrap_or(false);
+    let reverse = lua.opt_truthy(2).unwrap_or(false);
 
     let methods = [
-        lreg!("update", update),
-        lreg!("has", has),
-        lreg!("rank", rank),
-        lreg!("key_by_rank", key_by_rank),
-        lreg!("score", score),
-        lreg!("range", range),
-        lreg!("clear", clear),
-        lreg!("size", size),
-        lreg!("erase", erase),
+        lreg_try!("update", update),
+        lreg_try!("has", has),
+        lreg_try!("rank", rank),
+        lreg_try!("key_by_rank", key_by_rank),
+        lreg_try!("score", score),
+        lreg_try!("range", range),
+        lreg_try!("clear", clear),
+        lreg_try!("size", size),
+        lreg_try!("erase", erase),
         lreg_null!(),
     ];
 
-    if laux::lua_newuserdata(state, ZSet::new(max_count, reverse), ZSET_META, methods.as_ref())
-        .is_none()
+    if laux::lua_newuserdata(
+        state,
+        ZSet::new(max_count, reverse),
+        ZSET_META,
+        methods.as_ref(),
+    )
+    .is_none()
     {
-        laux::lua_error(state, "zset: failed to allocate userdata".to_string());
+        return Err("zset: failed to allocate userdata".to_string());
     }
-    1
+    Ok(1)
 }
 
 pub extern "C-unwind" fn luaopen_zset(state: LuaState) -> c_int {
-    let l = [lreg!("new", create), lreg_null!()];
+    let l = [lreg_try!("new", create), lreg_null!()];
     luaL_newlib!(state, l);
     1
 }
@@ -997,8 +1030,14 @@ mod tests {
     fn profile_flamegraph() {
         use std::io::Write;
 
-        let n: i64 = std::env::var("ZSET_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
-        let ops: usize = std::env::var("ZSET_OPS").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let n: i64 = std::env::var("ZSET_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000_000);
+        let ops: usize = std::env::var("ZSET_OPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000_000);
 
         // Local xorshift so key selection cost stays out of the skiplist frames.
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -1009,8 +1048,7 @@ mod tests {
             seed.wrapping_mul(0x2545_F491_4F6C_DD1D)
         };
 
-        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/profile");
+        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/profile");
         std::fs::create_dir_all(&out_dir).unwrap();
 
         // Run `body` under a fresh process-wide sampling profiler and write an SVG.
@@ -1025,7 +1063,10 @@ mod tests {
             let path = out_dir.join(format!("zset_{name}.svg"));
             let file = std::fs::File::create(&path).unwrap();
             report.flamegraph(file).expect("write flamegraph");
-            println!("[flamegraph] {name:14} -> {}", path.canonicalize().unwrap().display());
+            println!(
+                "[flamegraph] {name:14} -> {}",
+                path.canonicalize().unwrap().display()
+            );
         };
 
         let mut z = ZSet::new(usize::MAX, false);

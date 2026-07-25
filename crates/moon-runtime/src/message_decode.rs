@@ -6,7 +6,7 @@ use moon_runtime::{
     context::{Message, MessageBody},
 };
 
-use crate::lua_push_error;
+use crate::lua_push_error_tuple;
 
 /// Decode a runtime `Message` into Lua stack values.
 /// The decoder must consume the message payload (see `Message::take_body`).
@@ -96,7 +96,7 @@ pub unsafe extern "C-unwind" fn decode_error_message(state: LuaState, m: *mut Me
                 moon_base::laux::lua_push(state, message.as_ref());
                 2
             }
-            Err(e) => lua_push_error(state, &e),
+            Err(e) => lua_push_error_tuple(state, &e),
         }
     }
 }
@@ -112,7 +112,7 @@ pub unsafe extern "C-unwind" fn decode_integer_message(state: LuaState, m: *mut 
             other => {
                 let ptype = (*m).ptype();
                 (*m).data = other;
-                lua_push_error(
+                lua_push_error_tuple(
                     state,
                     &format!(
                         "expected ISize message body for ptype {}, got {}",
@@ -137,7 +137,7 @@ pub unsafe extern "C-unwind" fn decode_buffer_as_string_message(
                 moon_base::laux::lua_push(state, buf.as_slice());
                 1
             }
-            Err(e) => lua_push_error(state, &e),
+            Err(e) => lua_push_error_tuple(state, &e),
         }
     }
 }

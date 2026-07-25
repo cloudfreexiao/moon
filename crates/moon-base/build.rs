@@ -6,8 +6,8 @@ fn main() {
     // Always emit the Lua header directory so downstream build scripts (e.g.
     // C++ extension crates) can locate the Lua C API headers via the Cargo
     // `links = "lua55"` metadata variable DEP_LUA55_INCLUDE.
-    let lua_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
-        .join("lua55");
+    let lua_dir =
+        std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("lua55");
     println!("cargo:include={}", lua_dir.display());
 
     // The Lua C sources (and the small C helpers) are only compiled and linked

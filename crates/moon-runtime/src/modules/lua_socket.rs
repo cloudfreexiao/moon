@@ -2,8 +2,8 @@ use dashmap::DashMap;
 use lazy_static::lazy_static;
 use moon_base::{
     cstr, ffi,
-    laux::{self, LuaState, LuaType},
-    lreg, lreg_null, luaL_newlib,
+    laux::{self, LuaStack, LuaState, LuaType},
+    lreg, lreg_null, lreg_try, luaL_newlib,
 };
 use moon_runtime::{
     buffer::{BUFFER_HEAD_RESERVE, Buffer},
@@ -813,35 +813,45 @@ fn listen(addr: &str, owner: ActorId, max_connections: usize) -> Result<i64> {
     Ok(fd)
 }
 
-extern "C-unwind" fn lua_socket_listen(state: LuaState) -> c_int {
+fn lua_socket_listen(lua: &mut LuaStack<'_>) -> std::result::Result<c_int, String> {
     let _guard = CONTEXT.io_runtime().enter();
+    let state = lua.state();
 
-    let addr = unsafe { laux::lua_check_str(state, 1) };
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
 
     // Optional opts table at arg 2: { max_connections = N }.
     let max_connections: usize = if laux::lua_type(state, 2) == LuaType::Table {
-        laux::opt_field(state, 2, "max_connections").unwrap_or(crate::LIMITS.listener_connections)
+        lua.opt_field(2, "max_connections")
+            .unwrap_or(crate::LIMITS.listener_connections)
     } else {
         crate::LIMITS.listener_connections
     };
 
-    match listen(addr, owner, max_connections) {
+    let result = {
+        let addr = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "bad argument #1 (valid UTF-8 string expected)".to_string())?;
+        listen(addr, owner, max_connections)
+            .map_err(|err| format!("Listen '{}' failed: {}", addr, err))
+    };
+    match result {
         Ok(fd) => {
             laux::lua_push(state, fd);
-            1
+            Ok(1)
         }
-        Err(err) => crate::lua_push_error(state, &format!("Listen '{}' failed: {}", addr, err)),
+        Err(err) => Ok(crate::lua_push_error_tuple(state, &err)),
     }
 }
 
-extern "C-unwind" fn lua_socket_read(state: LuaState) -> c_int {
-    let fd = laux::lua_get(state, 1);
+fn lua_socket_read(lua: &mut LuaStack<'_>) -> std::result::Result<c_int, String> {
+    let state = lua.state();
+    let fd = lua.get(1)?;
 
     if laux::lua_type(state, 2) == LuaType::Integer {
-        let size = laux::lua_get(state, 2);
-        let read_timeout: u64 = laux::lua_opt(state, 3).unwrap_or(0);
+        let size = lua.get(2)?;
+        let read_timeout: u64 = lua.opt(3).unwrap_or(0);
         if let Some(channel) = NET.get(&fd) {
             let actor = LuaActor::from_lua_state(state);
             let owner = unsafe { (*actor).id };
@@ -860,25 +870,32 @@ extern "C-unwind" fn lua_socket_read(state: LuaState) -> c_int {
                 );
             };
             laux::lua_push(state, session);
-            1
+            Ok(1)
         } else {
-            crate::lua_push_error(state, &format!("read: fd {} not found", fd))
+            Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("read: fd {} not found", fd),
+            ))
         }
     } else {
-        let delim = unsafe { laux::lua_check_lstring(state, 2) };
+        let delim = match lua.value(2).as_bytes() {
+            Some(delim) => delim,
+            None => return Err("bad argument #2 (string expected)".to_string()),
+        };
         let delim = match Delimiter::new(delim) {
             Some(delim) => delim,
             None => {
-                return crate::lua_push_error(
+                return Ok(crate::lua_push_error_tuple(
                     state,
                     &format!("read: delim is empty or too long (max {} bytes)", 7),
-                );
+                ));
             }
         };
-        let max_size = laux::lua_opt(state, 3)
+        let max_size = lua
+            .opt(3)
             .unwrap_or(crate::LIMITS.max_network_read_bytes)
             .min(crate::LIMITS.max_network_read_bytes);
-        let read_timeout: u64 = laux::lua_opt(state, 4).unwrap_or(0);
+        let read_timeout: u64 = lua.opt(4).unwrap_or(0);
         if let Some(channel) = NET.get(&fd) {
             let actor = LuaActor::from_lua_state(state);
             let owner = unsafe { (*actor).id };
@@ -898,47 +915,62 @@ extern "C-unwind" fn lua_socket_read(state: LuaState) -> c_int {
                 );
             }
             laux::lua_push(state, session);
-            1
+            Ok(1)
         } else {
-            crate::lua_push_error(state, &format!("read: fd {} not found", fd))
+            Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("read: fd {} not found", fd),
+            ))
         }
     }
 }
 
-extern "C-unwind" fn lua_socket_write(state: LuaState) -> c_int {
+fn lua_socket_write(lua: &mut LuaStack<'_>) -> std::result::Result<c_int, String> {
+    let state = lua.state();
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
 
-    let fd = laux::lua_get(state, 1);
-    let data = check_arc_buffer(state, 2);
-    let max_write_capacity = laux::lua_opt(state, 3).unwrap_or(u16::MAX);
-    let close = laux::lua_opt(state, 4).unwrap_or(false);
+    let fd = lua.get(1)?;
+    let data = check_arc_buffer(lua, 2)?;
+    let max_write_capacity = lua.opt(3).unwrap_or(u16::MAX);
+    let close = lua.opt_truthy(4).unwrap_or(false);
 
     if let Some(channel) = NET.get(&fd) {
         if max_write_capacity != u16::MAX {
             let pending = channel.value().1.max_capacity() - channel.value().1.capacity();
             if pending > max_write_capacity as usize {
                 let _ = channel.value().1.try_send(NetOp::Close());
-                return crate::lua_push_error(state, &format!("write: backpressure (fd={})", fd));
+                return Ok(crate::lua_push_error_tuple(
+                    state,
+                    &format!("write: backpressure (fd={})", fd),
+                ));
             }
         }
         match channel.value().1.try_send(NetOp::Write(owner, data, close)) {
             Ok(_) => {
                 laux::lua_push(state, true);
-                1
+                Ok(1)
             }
-            Err(err) => {
-                crate::lua_push_error(state, &format!("write: channel full (fd={}): {}", fd, err))
-            }
+            Err(err) => Ok(crate::lua_push_error_tuple(
+                state,
+                &format!("write: channel full (fd={}): {}", fd, err),
+            )),
         }
     } else {
-        crate::lua_push_error(state, &format!("write: fd {} not found", fd))
+        Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("write: fd {} not found", fd),
+        ))
     }
 }
 
-extern "C-unwind" fn lua_socket_connect(state: LuaState) -> c_int {
-    let addr = unsafe { laux::lua_check_str(state, 1) }.to_string();
-    let connect_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(5000);
+fn lua_socket_connect(lua: &mut LuaStack<'_>) -> std::result::Result<c_int, String> {
+    let state = lua.state();
+    let addr = match lua.value(1).as_str() {
+        Some(addr) => addr.to_owned(),
+        None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
+    };
+    let connect_timeout: u64 = lua.opt(2).unwrap_or(5000);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -985,12 +1017,13 @@ extern "C-unwind" fn lua_socket_connect(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn lua_read_frame(state: LuaState) -> c_int {
-    let fd: i64 = laux::lua_get(state, 1);
-    let read_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(0);
+fn lua_read_frame(lua: &mut LuaStack<'_>) -> std::result::Result<c_int, String> {
+    let state = lua.state();
+    let fd: i64 = lua.get(1)?;
+    let read_timeout: u64 = lua.opt(2).unwrap_or(0);
 
     if let Some(channel) = NET.get(&fd) {
         let actor = LuaActor::from_lua_state(state);
@@ -1012,18 +1045,22 @@ extern "C-unwind" fn lua_read_frame(state: LuaState) -> c_int {
             }
         }
         laux::lua_push(state, session);
-        1
+        Ok(1)
     } else {
-        crate::lua_push_error(state, &format!("read_frame: fd {} not found", fd))
+        Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("read_frame: fd {} not found", fd),
+        ))
     }
 }
 
 /// Start auto-read mode for a framed fd (session=0, callback-based).
-extern "C-unwind" fn lua_start_read_frame(state: LuaState) -> c_int {
-    let fd: i64 = laux::lua_get(state, 1);
+fn lua_start_read_frame(lua: &mut LuaStack<'_>) -> std::result::Result<c_int, String> {
+    let state = lua.state();
+    let fd: i64 = lua.get(1)?;
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
-    let read_timeout: u64 = laux::lua_opt(state, 2).unwrap_or(0);
+    let read_timeout: u64 = lua.opt(2).unwrap_or(0);
 
     if let Some(channel) = NET.get(&fd) {
         match channel
@@ -1033,37 +1070,43 @@ extern "C-unwind" fn lua_start_read_frame(state: LuaState) -> c_int {
         {
             Ok(_) => {
                 laux::lua_push(state, true);
-                1
+                Ok(1)
             }
-            Err(err) => crate::lua_push_error(
+            Err(err) => Ok(crate::lua_push_error_tuple(
                 state,
                 &format!("start_read_frame: channel full (fd={}): {}", fd, err),
-            ),
+            )),
         }
     } else {
-        crate::lua_push_error(state, &format!("start_read_frame: fd {} not found", fd))
+        Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("start_read_frame: fd {} not found", fd),
+        ))
     }
 }
 
-extern "C-unwind" fn lua_socket_close(state: LuaState) -> c_int {
-    let fd = laux::lua_get(state, 1);
+fn lua_socket_close(lua: &mut LuaStack<'_>) -> std::result::Result<c_int, String> {
+    let state = lua.state();
+    let fd = lua.get(1)?;
 
     if let Some(channel) = NET.get(&fd) {
         match channel.value().1.try_send(NetOp::Close()) {
             Ok(_) => {
                 laux::lua_push(state, true);
-                return 1;
+                return Ok(1);
             }
             Err(_) => {
-                return 0;
+                return Ok(0);
             }
         }
     }
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn lua_host(state: LuaState) -> c_int {
-    if let Ok(addr) = laux::lua_opt(state, 1).unwrap_or("1.1.1.1:80").parse()
+fn lua_host(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let host: String = lua.opt(1).unwrap_or_else(|| "1.1.1.1:80".to_string());
+    if let Ok(addr) = host.parse()
         && let Ok(socket) = TcpStream::connect_timeout(&addr, Duration::from_millis(1000))
         && let Ok(local_addr) = socket.local_addr()
     {
@@ -1073,18 +1116,19 @@ extern "C-unwind" fn lua_host(state: LuaState) -> c_int {
     0
 }
 
-extern "C-unwind" fn lua_write_frame(state: LuaState) -> c_int {
+fn lua_write_frame(lua: &mut LuaStack<'_>) -> std::result::Result<c_int, String> {
+    let state = lua.state();
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
 
-    let fd: i64 = laux::lua_get(state, 1);
-    let data = check_arc_buffer(state, 2);
-    let max_write_capacity = laux::lua_opt(state, 3).unwrap_or(u16::MAX);
-    let close = laux::lua_opt(state, 4).unwrap_or(false);
+    let fd: i64 = lua.get(1)?;
+    let data = check_arc_buffer(lua, 2)?;
+    let max_write_capacity = lua.opt(3).unwrap_or(u16::MAX);
+    let close = lua.opt_truthy(4).unwrap_or(false);
 
     if data.is_empty() {
         laux::lua_push(state, true);
-        return 1;
+        return Ok(1);
     }
 
     if let Some(channel) = NET.get(&fd) {
@@ -1092,10 +1136,10 @@ extern "C-unwind" fn lua_write_frame(state: LuaState) -> c_int {
             let pending = channel.value().1.max_capacity() - channel.value().1.capacity();
             if pending > max_write_capacity as usize {
                 let _ = channel.value().1.try_send(NetOp::Close());
-                return crate::lua_push_error(
+                return Ok(crate::lua_push_error_tuple(
                     state,
                     &format!("write_frame: backpressure (fd={})", fd),
-                );
+                ));
             }
         }
         match channel
@@ -1105,15 +1149,18 @@ extern "C-unwind" fn lua_write_frame(state: LuaState) -> c_int {
         {
             Ok(_) => {
                 laux::lua_push(state, true);
-                1
+                Ok(1)
             }
-            Err(err) => crate::lua_push_error(
+            Err(err) => Ok(crate::lua_push_error_tuple(
                 state,
                 &format!("write_frame: channel full (fd={}): {}", fd, err),
-            ),
+            )),
         }
     } else {
-        crate::lua_push_error(state, &format!("write_frame: fd {} not found", fd))
+        Ok(crate::lua_push_error_tuple(
+            state,
+            &format!("write_frame: fd {} not found", fd),
+        ))
     }
 }
 
@@ -1152,7 +1199,10 @@ pub unsafe extern "C-unwind" fn decode_socket_event_message(
             MessageBody::Boxed(_, mut boxed) => {
                 let ptr = boxed.into_raw();
                 if ptr.is_null() {
-                    return crate::lua_push_error(state, "boxed message payload already consumed");
+                    return crate::lua_push_error_tuple(
+                        state,
+                        "boxed message payload already consumed",
+                    );
                 }
                 push_socket_event(state, *Box::from_raw(ptr as *mut SocketEvent))
             }
@@ -1162,7 +1212,7 @@ pub unsafe extern "C-unwind" fn decode_socket_event_message(
             }
             other => {
                 (*m).data = other;
-                crate::lua_push_error(
+                crate::lua_push_error_tuple(
                     state,
                     &format!(
                         "unexpected socket event message body for ptype {}",
@@ -1176,14 +1226,14 @@ pub unsafe extern "C-unwind" fn decode_socket_event_message(
 
 pub extern "C-unwind" fn luaopen_socket(state: LuaState) -> c_int {
     let l = [
-        lreg!("listen", lua_socket_listen),
-        lreg!("read", lua_socket_read),
-        lreg!("read_frame", lua_read_frame),
-        lreg!("start_read_frame", lua_start_read_frame),
-        lreg!("write", lua_socket_write),
-        lreg!("write_frame", lua_write_frame),
-        lreg!("connect", lua_socket_connect),
-        lreg!("close", lua_socket_close),
+        lreg_try!("listen", lua_socket_listen),
+        lreg_try!("read", lua_socket_read),
+        lreg_try!("read_frame", lua_read_frame),
+        lreg_try!("start_read_frame", lua_start_read_frame),
+        lreg_try!("write", lua_socket_write),
+        lreg_try!("write_frame", lua_write_frame),
+        lreg_try!("connect", lua_socket_connect),
+        lreg_try!("close", lua_socket_close),
         lreg!("host", lua_host),
         lreg_null!(),
     ];

@@ -3,8 +3,8 @@ use crate::{lua_require, luaopen_custom_libs, not_null_wrapper};
 use moon_base::{
     self, cstr,
     ffi::{self, luaL_Reg},
-    laux::{self, LuaState, LuaThread, LuaType},
-    lreg, lreg_null,
+    laux::{self, LuaStack, LuaState, LuaThread, LuaType},
+    lreg, lreg_null, lreg_try,
 };
 use moon_runtime::{
     actor::LuaActor,
@@ -26,6 +26,19 @@ use std::{
     },
 };
 
+fn stack_error_string(state: LuaState) -> String {
+    if laux::lua_type(state, -1) != LuaType::String {
+        return "no error message".to_string();
+    }
+    let mut len = 0;
+    let ptr = unsafe { ffi::lua_tolstring(state.as_ptr(), -1, &mut len) };
+    if ptr.is_null() {
+        return "no error message".to_string();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 fn global_seed() -> std::ffi::c_uint {
     static SEED: AtomicU32 = AtomicU32::new(0);
     let mut ret = SEED.load(Ordering::Acquire);
@@ -41,10 +54,18 @@ fn global_seed() -> std::ffi::c_uint {
 }
 
 extern "C-unwind" fn lua_actor_protect_init(state: LuaState) -> c_int {
+    match unsafe { laux::with_context(state, lua_actor_protect_init_impl) } {
+        Ok(result) => result,
+        Err(error) => crate::lua_push_error_tuple(state, &error),
+    }
+}
+
+fn lua_actor_protect_init_impl(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     unsafe {
         let param = ffi::lua_touserdata(state.as_ptr(), 1) as *mut LuaActorParam;
         if param.is_null() {
-            laux::lua_error(state, "invalid param".to_string());
+            return Err("invalid param".to_string());
         }
 
         ffi::luaL_openlibs(state.as_ptr());
@@ -61,7 +82,7 @@ extern "C-unwind" fn lua_actor_protect_init(state: LuaState) -> c_int {
         let loader = CONTEXT.module_loader();
         if let Some(loader) = loader.as_ref() {
             if let Err(error) = install_module_searcher(state, loader.clone()) {
-                laux::lua_error(state, format!("install Rua module loader failed: {error}"));
+                return Err(format!("install Rua module loader failed: {error}"));
             }
         }
 
@@ -74,17 +95,19 @@ extern "C-unwind" fn lua_actor_protect_init(state: LuaState) -> c_int {
                 ffi::luaL_loadfile(state.as_ptr(), source.as_ptr())
             });
         if load_status != ffi::LUA_OK {
-            return 1;
+            return Ok(1);
         }
 
         let params = CString::new((*param).params.as_str()).unwrap();
         if ffi::luaL_dostring(state.as_ptr(), params.as_ptr()) != ffi::LUA_OK {
-            return 1;
+            return Ok(1);
         }
 
+        drop(loader);
+        drop(params);
         ffi::lua_call(state.as_ptr(), 1, 0);
 
-        0
+        Ok(0)
     }
 }
 
@@ -339,9 +362,7 @@ pub fn init(
         if ffi::lua_pcall(main_state, 1, ffi::LUA_MULTRET, trace_fn) != ffi::LUA_OK
             || ffi::lua_gettop(main_state) != 1
         {
-            let raw = laux::lua_opt_str(state, -1)
-                .unwrap_or("no error message")
-                .to_string();
+            let raw = stack_error_string(state);
             let context = LuaErrorContext {
                 actor_id: params.id,
                 actor_name: params.name.clone(),
@@ -374,7 +395,11 @@ fn handle(actor: &mut LuaActor, m: &mut Message) {
 
     unsafe {
         let trace = 1;
-        ffi::luaL_checkstack(callback_state, 8, cstr!("message dispatch"));
+        let callback = LuaState::new(callback_state).expect("callback Lua state is null");
+        if let Err(error) = laux::lua_checkstack(callback, 8, cstr!("message dispatch")) {
+            log::error!("actor message dispatch failed: {error}");
+            return;
+        }
         ffi::lua_pushvalue(callback_state, 2);
 
         ffi::lua_pushinteger(callback_state, m.ptype() as ffi::lua_Integer);
@@ -388,9 +413,10 @@ fn handle(actor: &mut LuaActor, m: &mut Message) {
         }
 
         let raw = match r {
-            ffi::LUA_ERRRUN => laux::lua_opt_str(LuaState::new(callback_state).unwrap(), -1)
-                .unwrap_or("no error message")
-                .to_string(),
+            ffi::LUA_ERRRUN => {
+                let callback = LuaState::new(callback_state).unwrap();
+                stack_error_string(callback)
+            }
             ffi::LUA_ERRMEM => "memory error".to_string(),
             ffi::LUA_ERRERR => "error in error".to_string(),
             _ => "unknown error".to_string(),
@@ -448,40 +474,43 @@ pub fn remove_actor(id: context::ActorId) -> Result<(), String> {
     }
 }
 
-extern "C-unwind" fn lua_actor_query(state: LuaState) -> c_int {
+fn lua_actor_query(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     if laux::lua_type(state, 1) == LuaType::Integer {
-        return 1;
+        return Ok(1);
     }
 
-    let name = unsafe { laux::lua_check_str(state, 1) };
-
-    if let Some(addr) = CONTEXT.query(name) {
-        laux::lua_push(state, *addr.value());
-    } else {
-        laux::lua_push(state, 0);
-    }
-    1
+    let addr = {
+        let name = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "core.query: UTF-8 string expected".to_string())?;
+        CONTEXT.query(name).map(|addr| *addr.value()).unwrap_or(0)
+    };
+    laux::lua_push(state, addr);
+    Ok(1)
 }
 
-extern "C-unwind" fn lua_actor_send(state: LuaState) -> c_int {
-    let ptype = laux::lua_get(state, 1);
+fn lua_actor_send(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let ptype: u8 = lua.get(1)?;
 
     if ptype == 0 {
-        laux::lua_arg_error(state, 1, cstr!("PTYPE must > 0"));
+        return Err("bad argument #1 (PTYPE must > 0)".to_string());
     }
 
-    let to: context::ActorId = laux::lua_get(state, 2);
+    let to: context::ActorId = lua.get(2)?;
     if to == 0 {
-        laux::lua_arg_error(state, 2, cstr!("receiver must > 0"));
+        return Err("bad argument #2 (receiver must > 0)".to_string());
     }
 
-    let data = check_buffer(state, 3);
+    let data = check_buffer(lua, 3)?;
 
     let actor = LuaActor::from_lua_state(state);
 
-    let session = laux::lua_opt(state, 4).unwrap_or(unsafe { (*actor).next_session() });
+    let session = lua.opt(4).unwrap_or(unsafe { (*actor).next_session() });
 
-    let from: context::ActorId = laux::lua_opt(state, 5).unwrap_or(unsafe { (*actor).id });
+    let from: context::ActorId = lua.opt(5).unwrap_or(unsafe { (*actor).id });
 
     if let Some(m) = CONTEXT.send(Message {
         from,
@@ -503,34 +532,39 @@ extern "C-unwind" fn lua_actor_send(state: LuaState) -> c_int {
     laux::lua_push(state, session);
     laux::lua_push(state, to);
 
-    2
+    Ok(2)
 }
 
-extern "C-unwind" fn lua_kill_actor(state: LuaState) -> c_int {
-    let who: context::ActorId = laux::lua_get(state, 1);
+fn lua_kill_actor(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let who: context::ActorId = lua.get(1)?;
     let res = remove_actor(who);
     match res {
         Ok(_) => {
             laux::lua_push(state, true);
-            1
+            Ok(1)
         }
-        Err(err) => crate::lua_push_error(state, &err),
+        Err(err) => Ok(crate::lua_push_error_tuple(state, &err)),
     }
 }
 
-extern "C-unwind" fn lua_new_actor(state: LuaState) -> c_int {
-    laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
+fn lua_new_actor(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    laux::lua_checktype(state, 1, ffi::LUA_TTABLE)
+        .map_err(|err| format!("core.new_service: argument #1 {err}"))?;
 
     let actor = LuaActor::from_lua_state(state);
 
     let creator = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
-    let name: String = laux::opt_field(state, 1, "name").unwrap_or_default();
-    let source = laux::opt_field(state, 1, "source").unwrap_or_default();
-    let memlimit: i64 = laux::opt_field(state, 1, "memlimit").unwrap_or_default();
-    let unique: bool = laux::opt_field(state, 1, "unique").unwrap_or_default();
+    let name: String = lua.opt_field(1, "name").unwrap_or_default();
+    let source = lua.opt_field(1, "source").unwrap_or_default();
+    let memlimit: i64 = lua.opt_field(1, "memlimit").unwrap_or_default();
+    let unique: bool = lua.opt_field(1, "unique").unwrap_or_default();
 
-    let mut params: String = laux::lua_get(state, 2);
+    let mut params = lua
+        .get::<String>(2)
+        .map_err(|err| format!("core.new_service: argument #2 {err}"))?;
     if let Some(p) = CONTEXT.get_env("PATH") {
         params = String::from_utf8_lossy(&p).into_owned() + params.as_str();
     }
@@ -549,12 +583,14 @@ extern "C-unwind" fn lua_new_actor(state: LuaState) -> c_int {
 
     laux::lua_push(state, session);
 
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn lua_actor_callback(state: LuaState) -> c_int {
+fn lua_actor_callback(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    laux::lua_checktype(state, 1, ffi::LUA_TFUNCTION)
+        .map_err(|err| format!("core.callback: argument #1 {err}"))?;
     unsafe {
-        ffi::luaL_checktype(state.as_ptr(), 1, ffi::LUA_TFUNCTION);
         ffi::lua_settop(state.as_ptr(), 1);
         let actor = LuaActor::from_lua_state(state);
         ffi::lua_newuserdatauv(state.as_ptr(), 1, 1);
@@ -568,12 +604,13 @@ extern "C-unwind" fn lua_actor_callback(state: LuaState) -> c_int {
         );
         ffi::lua_xmove(state.as_ptr(), callback_state, 1);
         (*actor).callback_state = LuaThread::new(callback_state);
-        0
+        Ok(0)
     }
 }
 
-extern "C-unwind" fn lua_timeout(state: LuaState) -> c_int {
-    let interval: i64 = laux::lua_get(state, 1);
+fn lua_timeout(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let interval: i64 = lua.get(1)?;
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
     let timer_id = unsafe { (*actor).next_session() };
@@ -590,43 +627,56 @@ extern "C-unwind" fn lua_timeout(state: LuaState) -> c_int {
     }
 
     laux::lua_push(state, timer_id);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn lua_loglevel(state: LuaState) -> c_int {
+fn lua_loglevel(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     if laux::lua_top(state) == 0 {
         laux::lua_push(state, LOGGER.get_log_level() as u8);
-        return 1;
+        return Ok(1);
     }
 
-    let level = laux::lua_get(state, 1);
+    let level: String = lua.get(1)?;
     LOGGER.set_log_level(Logger::string_to_level(level));
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn lua_actor_log(state: LuaState) -> c_int {
-    let log_level: u8 = laux::lua_get(state, 1);
+fn lua_actor_log(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let log_level: u8 = lua.get(1)?;
     // Honor the configured log level. The u8 scheme is severity-ordered
     // (Error=1 .. Trace=5), so a message is emitted only when its level is at
     // or above the threshold (e.g. an INFO=3 threshold drops DEBUG=4/TRACE=5).
     if log_level > Logger::level_to_u8(LOGGER.get_log_level()) {
-        return 0;
+        return Ok(0);
     }
-    let stack_level: i32 = laux::lua_get(state, 2);
+    let stack_level: i32 = lua.get(2)?;
     let actor = LuaActor::from_lua_state(state);
+
+    let top = laux::lua_top(state);
+    // `luaL_tolstring` may invoke a user `__tostring` metamethod and longjmp.
+    // Keep converted values on the Lua stack until every conversion succeeds,
+    // so no Rust-owned buffer is alive across that call.
+    for i in 3..=top {
+        let mut len = 0;
+        let ptr = unsafe { ffi::luaL_tolstring(state.as_ptr(), i, &mut len) };
+        if ptr.is_null() {
+            laux::lua_settop(state, top);
+            return Err(format!("log: argument #{i} cannot be converted to string"));
+        }
+    }
 
     let mut content = LOGGER.make_line(true, Logger::u8_to_level(log_level), 256);
     content.write_str(format!("{:08X}| ", unsafe { (*actor).id }).as_str());
-
-    let top = laux::lua_top(state);
     for i in 3..=top {
         if i > 3 {
             content.write_str("    ");
         }
-
-        content.write_slice(unsafe { laux::lua_as_slice(state, i) });
-        laux::lua_pop(state, 1);
+        let converted_index = top + i - 2;
+        content.write_slice(lua.value(converted_index).as_bytes().unwrap_or_default());
     }
+    laux::lua_settop(state, top);
 
     let mut debug: ffi::lua_Debug = unsafe { std::mem::zeroed() };
     if unsafe {
@@ -650,39 +700,51 @@ extern "C-unwind" fn lua_actor_log(state: LuaState) -> c_int {
 
     LOGGER.write(content);
 
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn lua_actor_exit(state: LuaState) -> c_int {
-    let exit_code = laux::lua_get(state, 1);
+fn lua_actor_exit(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let exit_code: i32 = lua.get(1)?;
     CONTEXT.shutdown(exit_code);
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn env(state: LuaState) -> c_int {
+fn env(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     if laux::lua_top(state) == 2 {
-        let key = unsafe { laux::lua_check_str(state, 1) };
-        let value = laux::lua_get::<&[u8]>(state, 2);
+        let key = match lua.value(1).as_str() {
+            Some(key) => key,
+            None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
+        };
+        let value = match lua.value(2).as_bytes() {
+            Some(value) => value,
+            None => return Err("bad argument #2 (string expected)".to_string()),
+        };
         CONTEXT.set_env(key, value);
-        0
+        Ok(0)
     } else {
-        let key = unsafe { laux::lua_check_str(state, 1) };
+        let key = match lua.value(1).as_str() {
+            Some(key) => key,
+            None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
+        };
         if let Some(value) = CONTEXT.get_env(key) {
             laux::lua_push(state, value.as_slice());
-            1
+            Ok(1)
         } else {
-            0
+            Ok(0)
         }
     }
 }
 
-extern "C-unwind" fn clock(state: LuaState) -> c_int {
+fn clock(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     laux::lua_push(state, CONTEXT.clock());
     1
 }
 
-extern "C-unwind" fn now(state: LuaState) -> c_int {
-    let unit: i64 = laux::lua_opt(state, 1).unwrap_or(1);
+fn now(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let unit: i64 = lua.opt(1).unwrap_or(1);
     let unit = unit.max(1);
     laux::lua_push(state, CONTEXT.now().timestamp_millis() / unit);
     1
@@ -696,9 +758,16 @@ fn get_message_pointer(state: LuaState) -> *mut Message {
     m
 }
 
-extern "C-unwind" fn lua_message_decode(state: LuaState) -> c_int {
+fn lua_message_decode(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     let m = get_message_pointer(state);
-    let opt = unsafe { laux::lua_check_str(state, 2) };
+    // SAFETY: argument 2 remains rooted for this callback; the loop only
+    // appends return values above it and never pops, replaces, or reorders it.
+    let opt = unsafe {
+        lua.value_bytes_append_only(2)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    }
+    .ok_or_else(|| "core.decode: UTF-8 string expected".to_string())?;
     let top = unsafe { ffi::lua_gettop(state.as_ptr()) };
     // Access the Message only through the raw pointer with transient,
     // narrowly-scoped (re)borrows; never mint a long-lived `&mut Message`.
@@ -762,55 +831,63 @@ extern "C-unwind" fn lua_message_decode(state: LuaState) -> c_int {
                 }
             }
             _ => {
-                laux::lua_error(state, format!("invalid format option '{0}'", c));
+                return Err(format!("invalid format option '{0}'", c));
             }
         }
     }
-    laux::lua_top(state) - top
+    Ok(laux::lua_top(state) - top)
 }
 
-extern "C-unwind" fn lua_decode_message_payload(state: LuaState) -> c_int {
-    laux::lua_checkstack(state, 16, std::ptr::null());
+fn lua_decode_message_payload(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    laux::lua_checkstack(state, 16, std::ptr::null())?;
     let m = get_message_pointer(state);
     unsafe {
         let ptype = (*m).ptype();
         let decode = crate::DECODERS[ptype as usize];
-        decode(state, m)
+        Ok(decode(state, m))
     }
 }
 
-extern "C-unwind" fn next_session(state: LuaState) -> c_int {
+fn next_session(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     laux::lua_push(state, unsafe {
         (*LuaActor::from_lua_state(state)).next_session()
     });
     1
 }
 
-extern "C-unwind" fn server_stats(state: LuaState) -> c_int {
+fn server_stats(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     // Backward-compatible scalar lookup: `server_stats("service.count")` keeps
     // returning a single integer. With no argument, return the full snapshot as
     // a JSON string.
     if laux::lua_type(state, 1) == LuaType::String {
-        let opt = unsafe { laux::lua_check_str(state, 1) };
-        let value: i64 = match opt {
-            "service.count" => CONTEXT.actor_count() as i64,
-            "service.registered" => CONTEXT.registered_actor_count() as i64,
-            "service.unique" => CONTEXT.unique_actor_count() as i64,
-            "service.created" => CONTEXT.total_actor_created() as i64,
-            "log.error_count" => CONTEXT.error_count() as i64,
-            "log.queue" => LOGGER.pending_count() as i64,
-            "timer.count" => CONTEXT.timer_count() as i64,
-            "env.count" => CONTEXT.env_count() as i64,
-            "time.offset" => CONTEXT.time_offset() as i64,
-            "time.now" => CONTEXT.now().timestamp_millis(),
-            "uptime" => CONTEXT.uptime_secs() as i64,
-            "memory.total" => CONTEXT.total_memory(),
-            "message.total" => CONTEXT.total_messages() as i64,
-            "cpu.total_ms" => CONTEXT.total_cpu_ms() as i64,
-            _ => 0,
+        let value: i64 = {
+            let key = lua
+                .value(1)
+                .as_str()
+                .ok_or_else(|| "core.server_stats: UTF-8 string expected".to_string())?;
+            match key {
+                "service.count" => CONTEXT.actor_count() as i64,
+                "service.registered" => CONTEXT.registered_actor_count() as i64,
+                "service.unique" => CONTEXT.unique_actor_count() as i64,
+                "service.created" => CONTEXT.total_actor_created() as i64,
+                "log.error_count" => CONTEXT.error_count() as i64,
+                "log.queue" => LOGGER.pending_count() as i64,
+                "timer.count" => CONTEXT.timer_count() as i64,
+                "env.count" => CONTEXT.env_count() as i64,
+                "time.offset" => CONTEXT.time_offset() as i64,
+                "time.now" => CONTEXT.now().timestamp_millis(),
+                "uptime" => CONTEXT.uptime_secs() as i64,
+                "memory.total" => CONTEXT.total_memory(),
+                "message.total" => CONTEXT.total_messages() as i64,
+                "cpu.total_ms" => CONTEXT.total_cpu_ms() as i64,
+                _ => 0,
+            }
         };
         laux::lua_push(state, value);
-        return 1;
+        return Ok(1);
     }
 
     let services: Vec<serde_json::Value> = CONTEXT
@@ -847,27 +924,27 @@ extern "C-unwind" fn server_stats(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, stats.to_string().as_str());
-    1
+    Ok(1)
 }
 
 unsafe extern "C-unwind" fn luaopen_core(state: LuaState) -> c_int {
     let l = [
-        lreg!("new_service", lua_new_actor),
-        lreg!("query", lua_actor_query),
-        lreg!("kill", lua_kill_actor),
-        lreg!("send", lua_actor_send),
-        lreg!("log", lua_actor_log),
-        lreg!("loglevel", lua_loglevel),
-        lreg!("callback", lua_actor_callback),
-        lreg!("exit", lua_actor_exit),
-        lreg!("timeout", lua_timeout),
-        lreg!("decode", lua_message_decode),
-        lreg!("decode_message", lua_decode_message_payload),
-        lreg!("env", env),
+        lreg_try!("new_service", lua_new_actor),
+        lreg_try!("query", lua_actor_query),
+        lreg_try!("kill", lua_kill_actor),
+        lreg_try!("send", lua_actor_send),
+        lreg_try!("log", lua_actor_log),
+        lreg_try!("loglevel", lua_loglevel),
+        lreg_try!("callback", lua_actor_callback),
+        lreg_try!("exit", lua_actor_exit),
+        lreg_try!("timeout", lua_timeout),
+        lreg_try!("decode", lua_message_decode),
+        lreg_try!("decode_message", lua_decode_message_payload),
+        lreg_try!("env", env),
         lreg!("clock", clock),
         lreg!("now", now),
         lreg!("next_session", next_session),
-        lreg!("server_stats", server_stats),
+        lreg_try!("server_stats", server_stats),
         lreg_null!(),
     ];
 

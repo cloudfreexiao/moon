@@ -1,11 +1,15 @@
-use moon_base::{cstr, ffi, laux, lreg, lreg_null, luaL_newlib};
+use moon_base::{cstr, ffi, laux, lreg_null, lreg_try, luaL_newlib};
 use rand::RngExt;
 use std::ffi::c_int;
 
-use moon_base::laux::LuaState;
+use moon_base::laux::{LuaStack, LuaState};
 
-fn table_to_i64_vec(state: LuaState, index: c_int) -> Result<Vec<i64>, String> {
-    let abs_index = laux::lua_absindex(state, index);
+fn table_to_i64_vec(lua: &LuaStack<'_>, index: c_int) -> Result<Vec<i64>, String> {
+    let state = lua.state();
+    if laux::lua_type(state, index) != laux::LuaType::Table {
+        return Err(format!("argument #{} must be a table", index));
+    }
+    let abs_index = lua.abs_index(index);
     let len = unsafe { ffi::lua_rawlen(state.as_ptr(), abs_index) };
     let mut values = Vec::with_capacity(len);
 
@@ -29,94 +33,77 @@ fn checked_range_len(min: i64, max: i64) -> Option<i64> {
     max.checked_sub(min)?.checked_add(1)
 }
 
-extern "C-unwind" fn rand_range(state: LuaState) -> c_int {
-    let min = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 1) as i64 };
-    let max = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 2) as i64 };
+fn rand_range(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let min: i64 = lua.get(1).map_err(|e| format!("random.rand_range: {e}"))?;
+    let max: i64 = lua.get(2).map_err(|e| format!("random.rand_range: {e}"))?;
     if min > max {
-        laux::lua_error(
-            state,
-            format!(
-                "random.rand_range: min value must be less than or equal to max value, got min={} and max={}",
-                min, max
-            ),
-        );
+        return Err(format!(
+            "random.rand_range: min value must be less than or equal to max value, got min={} and max={}",
+            min, max
+        ));
     }
 
     let value = rand::rng().random_range(min..=max);
-    laux::lua_push(state, value as ffi::lua_Integer);
-    1
+    lua.push(value);
+    Ok(1)
 }
 
-extern "C-unwind" fn rand_range_some(state: LuaState) -> c_int {
-    let min = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 1) as i64 };
-    let max = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 2) as i64 };
-    let count = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 3) as i64 };
+fn rand_range_some(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let min: i64 = lua
+        .get(1)
+        .map_err(|e| format!("random.rand_range_some: {e}"))?;
+    let max: i64 = lua
+        .get(2)
+        .map_err(|e| format!("random.rand_range_some: {e}"))?;
+    let count: i64 = lua
+        .get(3)
+        .map_err(|e| format!("random.rand_range_some: {e}"))?;
 
     if min > max {
-        laux::lua_error(
-            state,
-            format!(
-                "random.rand_range_some: min value must be less than or equal to max value, got min={} and max={}",
-                min, max
-            ),
-        );
+        return Err(format!(
+            "random.rand_range_some: min value must be less than or equal to max value, got min={} and max={}",
+            min, max
+        ));
     }
 
     let Some(range_len) = checked_range_len(min, max) else {
-        laux::lua_error(
-            state,
-            "random.rand_range_some: range size overflow".to_string(),
-        );
+        return Err("random.rand_range_some: range size overflow".to_string());
     };
 
     if count <= 0 || range_len < count {
-        laux::lua_error(
-            state,
-            format!(
-                "random.rand_range_some: count must be in range [1, {}], got {}",
-                range_len, count
-            ),
-        );
+        return Err(format!(
+            "random.rand_range_some: count must be in range [1, {}], got {}",
+            range_len, count
+        ));
     }
 
-    let range_len_usize = usize::try_from(range_len).unwrap_or_else(|_| {
-        laux::lua_error(
-            state,
-            "random.rand_range_some: range size is too large".to_string(),
-        )
-    });
-    let count_usize = usize::try_from(count).unwrap_or_else(|_| {
-        laux::lua_error(
-            state,
-            "random.rand_range_some: count is too large".to_string(),
-        )
-    });
+    let range_len_usize = usize::try_from(range_len)
+        .map_err(|_| "random.rand_range_some: range size is too large".to_string())?;
+    let count_usize = usize::try_from(count)
+        .map_err(|_| "random.rand_range_some: count is too large".to_string())?;
 
     let mut values: Vec<i64> = (0..range_len_usize).map(|i| min + i as i64).collect();
-    let table = laux::LuaTable::new(state, count_usize, 0);
+    let table = laux::LuaTable::new(lua.state(), count_usize, 0);
     let mut rng = rand::rng();
 
     for i in 1..=count_usize {
         let index = rng.random_range(0..values.len());
-        laux::lua_push(state, values[index] as ffi::lua_Integer);
+        lua.push(values[index]);
         table.rawseti(i);
         values.swap_remove(index);
     }
 
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn randf_range(state: LuaState) -> c_int {
-    let min = unsafe { ffi::luaL_checknumber(state.as_ptr(), 1) };
-    let max = unsafe { ffi::luaL_checknumber(state.as_ptr(), 2) };
+fn randf_range(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let min: f64 = lua.get(1).map_err(|e| format!("random.randf_range: {e}"))?;
+    let max: f64 = lua.get(2).map_err(|e| format!("random.randf_range: {e}"))?;
     if !min.is_finite() || !max.is_finite() || min > max {
-        laux::lua_error(
-            state,
-            format!(
-                "random.randf_range: min and max must be finite with min <= max, got min={} and max={}",
-                min, max
-            ),
-        );
+        return Err(format!(
+            "random.randf_range: min and max must be finite with min <= max, got min={} and max={}",
+            min, max
+        ));
     }
 
     let value = if min == max {
@@ -124,15 +111,17 @@ extern "C-unwind" fn randf_range(state: LuaState) -> c_int {
     } else {
         rand::rng().random_range(min..max)
     };
-    laux::lua_push(state, value);
-    1
+    lua.push(value);
+    Ok(1)
 }
 
-extern "C-unwind" fn randf_percent(state: LuaState) -> c_int {
-    let percent = unsafe { ffi::luaL_checknumber(state.as_ptr(), 1) };
+fn randf_percent(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let percent: f64 = lua
+        .get(1)
+        .map_err(|e| format!("random.randf_percent: {e}"))?;
     let value = percent > 0.0 && rand::rng().random_range(0.0..1.0) < percent;
-    laux::lua_push(state, value);
-    1
+    lua.push(value);
+    Ok(1)
 }
 
 fn choose_weighted(values: &[i64], weights: &[i64]) -> Option<i64> {
@@ -156,13 +145,10 @@ fn choose_weighted(values: &[i64], weights: &[i64]) -> Option<i64> {
     values.last().copied()
 }
 
-extern "C-unwind" fn rand_weight(state: LuaState) -> c_int {
-    laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
-    laux::lua_checktype(state, 2, ffi::LUA_TTABLE);
-
+fn rand_weight(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let result = (|| {
-        let values = table_to_i64_vec(state, 1)?;
-        let weights = table_to_i64_vec(state, 2)?;
+        let values = table_to_i64_vec(lua, 1)?;
+        let weights = table_to_i64_vec(lua, 2)?;
         if values.len() != weights.len() || values.is_empty() {
             return Err(
                 "random.rand_weight: 'values' and 'weights' must be non-empty tables of equal length"
@@ -177,22 +163,22 @@ extern "C-unwind" fn rand_weight(state: LuaState) -> c_int {
 
     match result {
         Ok(Some(value)) => {
-            laux::lua_push(state, value as ffi::lua_Integer);
-            1
+            lua.push(value);
+            Ok(1)
         }
-        Ok(None) => 0,
-        Err(err) => laux::lua_error(state, err),
+        Ok(None) => Ok(0),
+        Err(err) => Err(err),
     }
 }
 
-extern "C-unwind" fn rand_weight_some(state: LuaState) -> c_int {
-    laux::lua_checktype(state, 1, ffi::LUA_TTABLE);
-    laux::lua_checktype(state, 2, ffi::LUA_TTABLE);
-    let count = unsafe { ffi::luaL_checkinteger(state.as_ptr(), 3) as i64 };
+fn rand_weight_some(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let count: i64 = lua
+        .get(3)
+        .map_err(|e| format!("random.rand_weight_some: {e}"))?;
 
     let result = (|| {
-        let mut values = table_to_i64_vec(state, 1)?;
-        let mut weights = table_to_i64_vec(state, 2)?;
+        let mut values = table_to_i64_vec(lua, 1)?;
+        let mut weights = table_to_i64_vec(lua, 2)?;
         if values.len() != weights.len()
             || values.is_empty()
             || count < 0
@@ -232,26 +218,26 @@ extern "C-unwind" fn rand_weight_some(state: LuaState) -> c_int {
 
     match result {
         Ok(Some(values)) => {
-            let table = laux::LuaTable::new(state, values.len(), 0);
+            let table = laux::LuaTable::new(lua.state(), values.len(), 0);
             for (idx, value) in values.into_iter().enumerate() {
-                laux::lua_push(state, value as ffi::lua_Integer);
+                lua.push(value);
                 table.rawseti(idx + 1);
             }
-            1
+            Ok(1)
         }
-        Ok(None) => 0,
-        Err(err) => laux::lua_error(state, err),
+        Ok(None) => Ok(0),
+        Err(err) => Err(err),
     }
 }
 
 pub unsafe extern "C-unwind" fn luaopen_random(state: LuaState) -> c_int {
     let l = [
-        lreg!("rand_range", rand_range),
-        lreg!("rand_range_some", rand_range_some),
-        lreg!("randf_range", randf_range),
-        lreg!("randf_percent", randf_percent),
-        lreg!("rand_weight", rand_weight),
-        lreg!("rand_weight_some", rand_weight_some),
+        lreg_try!("rand_range", rand_range),
+        lreg_try!("rand_range_some", rand_range_some),
+        lreg_try!("randf_range", randf_range),
+        lreg_try!("randf_percent", randf_percent),
+        lreg_try!("rand_weight", rand_weight),
+        lreg_try!("rand_weight_some", rand_weight_some),
         lreg_null!(),
     ];
 

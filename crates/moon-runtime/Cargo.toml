@@ -17,7 +17,7 @@ sqlx = ["dep:sqlx", "dep:phf", "dep:uuid", "dep:futures-util"]
 mongodb = ["dep:mongodb", "dep:futures-util"]
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 pg = ["dep:url"]
-redis = []
+redis = ["dep:url"]
 # gRPC client + server over HTTP/2 (tonic codec/framing on a hyper http2 listener);
 # protobuf encode/decode stays in lua_protobuf.
 grpc = [

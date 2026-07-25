@@ -103,9 +103,13 @@ pub type lua_Alloc =
     unsafe extern "C" fn(ud: *mut c_void, ptr: *mut c_void, osize: usize, nsize: usize) -> *mut c_void;
 
 /// Type for warning functions
-pub type lua_WarnFunction = unsafe extern "C-unwind" fn(ud: *mut c_void, msg: *const c_char, tocont: c_int);
+pub type lua_WarnFunction =
+    unsafe extern "C-unwind" fn(ud: *mut c_void, msg: *const c_char, tocont: c_int);
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     //
     // State manipulation
@@ -158,9 +162,9 @@ unsafe extern "C-unwind" {
 // lua_rawlen's return type changed from size_t to lua_Unsigned int in Lua 5.4.
 // This adapts the crate API to the new Lua ABI.
 #[inline(always)]
-pub unsafe fn lua_rawlen(L: *mut lua_State, idx: c_int) -> usize { unsafe {
-    lua_rawlen_(L, idx) as usize
-}}
+pub unsafe fn lua_rawlen(L: *mut lua_State, idx: c_int) -> usize {
+    unsafe { lua_rawlen_(L, idx) as usize }
+}
 
 //
 // Comparison and arithmetic functions
@@ -184,14 +188,20 @@ pub const LUA_OPEQ: c_int = 0;
 pub const LUA_OPLT: c_int = 1;
 pub const LUA_OPLE: c_int = 2;
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     pub fn lua_arith(L: *mut lua_State, op: c_int);
     pub fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c_int;
     pub fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c_int) -> c_int;
 }
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     //
     // Push functions (C -> stack)
@@ -271,20 +281,28 @@ unsafe extern "C-unwind" {
         mode: *const c_char,
     ) -> c_int;
 
-    pub fn lua_dump(L: *mut lua_State, writer: lua_Writer, data: *mut c_void, strip: c_int) -> c_int;
+    pub fn lua_dump(
+        L: *mut lua_State,
+        writer: lua_Writer,
+        data: *mut c_void,
+        strip: c_int,
+    ) -> c_int;
 }
 
 #[inline(always)]
-pub unsafe fn lua_call(L: *mut lua_State, n: c_int, r: c_int) { unsafe {
-    lua_callk(L, n, r, 0, None)
-}}
+pub unsafe fn lua_call(L: *mut lua_State, n: c_int, r: c_int) {
+    unsafe { lua_callk(L, n, r, 0, None) }
+}
 
 #[inline(always)]
-pub unsafe fn lua_pcall(L: *mut lua_State, n: c_int, r: c_int, f: c_int) -> c_int { unsafe {
-    lua_pcallk(L, n, r, f, 0, None)
-}}
+pub unsafe fn lua_pcall(L: *mut lua_State, n: c_int, r: c_int, f: c_int) -> c_int {
+    unsafe { lua_pcallk(L, n, r, f, 0, None) }
+}
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     //
     // Coroutine functions
@@ -295,20 +313,28 @@ unsafe extern "C-unwind" {
         ctx: lua_KContext,
         k: Option<lua_KFunction>,
     ) -> c_int;
-    pub fn lua_resume(L: *mut lua_State, from: *mut lua_State, narg: c_int, nres: *mut c_int) -> c_int;
+    pub fn lua_resume(
+        L: *mut lua_State,
+        from: *mut lua_State,
+        narg: c_int,
+        nres: *mut c_int,
+    ) -> c_int;
     pub fn lua_status(L: *mut lua_State) -> c_int;
     pub fn lua_isyieldable(L: *mut lua_State) -> c_int;
 }
 
 #[inline(always)]
-pub unsafe fn lua_yield(L: *mut lua_State, n: c_int) -> c_int { unsafe {
-    lua_yieldk(L, n, 0, None)
-}}
+pub unsafe fn lua_yield(L: *mut lua_State, n: c_int) -> c_int {
+    unsafe { lua_yieldk(L, n, 0, None) }
+}
 
 //
 // Warning-related functions
 //
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     pub fn lua_setwarnf(L: *mut lua_State, f: Option<lua_WarnFunction>, ud: *mut c_void);
     pub fn lua_warning(L: *mut lua_State, msg: *const c_char, tocont: c_int);
@@ -340,12 +366,18 @@ pub const LUA_GCPSTEPSIZE: c_int = 5; // GC granularity
 
 pub const LUA_GCPNUM: c_int = 6; // number of parameters
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     pub fn lua_gc(L: *mut lua_State, what: c_int, ...) -> c_int;
 }
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     //
     // Miscellaneous functions
@@ -368,150 +400,164 @@ unsafe extern "C-unwind" {
 // ! to void which can cause link-time errors if the platform linker is aware
 // of return types and requires they match (for example: wasm does this).
 #[inline(always)]
-pub unsafe fn lua_error(L: *mut lua_State) -> ! { unsafe {
-    lua_error_(L);
-    unreachable!();
-}}
+pub unsafe fn lua_error(L: *mut lua_State) -> ! {
+    unsafe {
+        lua_error_(L);
+        unreachable!();
+    }
+}
 
 //
 // Some useful macros (implemented as Rust functions)
 //
 #[inline(always)]
-pub unsafe fn lua_getextraspace(L: *mut lua_State) -> *mut c_void { unsafe {
-    (L as *mut c_char).sub(LUA_EXTRASPACE) as *mut c_void
-}}
+pub unsafe fn lua_getextraspace(L: *mut lua_State) -> *mut c_void {
+    unsafe { (L as *mut c_char).sub(LUA_EXTRASPACE) as *mut c_void }
+}
 
 #[inline(always)]
-pub unsafe fn lua_tonumber(L: *mut lua_State, i: c_int) -> lua_Number { unsafe {
-    lua_tonumberx(L, i, ptr::null_mut())
-}}
+pub unsafe fn lua_tonumber(L: *mut lua_State, i: c_int) -> lua_Number {
+    unsafe { lua_tonumberx(L, i, ptr::null_mut()) }
+}
 
 #[inline(always)]
-pub unsafe fn lua_tointeger(L: *mut lua_State, i: c_int) -> lua_Integer { unsafe {
-    lua_tointegerx(L, i, ptr::null_mut())
-}}
+pub unsafe fn lua_tointeger(L: *mut lua_State, i: c_int) -> lua_Integer {
+    unsafe { lua_tointegerx(L, i, ptr::null_mut()) }
+}
 
 #[inline(always)]
-pub unsafe fn lua_pop(L: *mut lua_State, n: c_int) { unsafe {
-    lua_settop(L, -n - 1)
-}}
+pub unsafe fn lua_pop(L: *mut lua_State, n: c_int) {
+    unsafe { lua_settop(L, -n - 1) }
+}
 
 #[inline(always)]
-pub unsafe fn lua_newtable(L: *mut lua_State) { unsafe {
-    lua_createtable(L, 0, 0)
-}}
+pub unsafe fn lua_newtable(L: *mut lua_State) {
+    unsafe { lua_createtable(L, 0, 0) }
+}
 
 #[inline(always)]
-pub unsafe fn lua_register(L: *mut lua_State, n: *const c_char, f: lua_CFunction) { unsafe {
-    lua_pushcfunction(L, f);
-    lua_setglobal(L, n)
-}}
-
-#[inline(always)]
-pub unsafe fn lua_pushcfunction(L: *mut lua_State, f: lua_CFunction) { unsafe {
-    lua_pushcclosure(L, f, 0)
-}}
-
-#[inline(always)]
-pub unsafe fn lua_isfunction(L: *mut lua_State, n: c_int) -> c_int { unsafe {
-    (lua_type(L, n) == LUA_TFUNCTION) as c_int
-}}
-
-#[inline(always)]
-pub unsafe fn lua_istable(L: *mut lua_State, n: c_int) -> c_int { unsafe {
-    (lua_type(L, n) == LUA_TTABLE) as c_int
-}}
-
-#[inline(always)]
-pub unsafe fn lua_islightuserdata(L: *mut lua_State, n: c_int) -> c_int { unsafe {
-    (lua_type(L, n) == LUA_TLIGHTUSERDATA) as c_int
-}}
-
-#[inline(always)]
-pub unsafe fn lua_isnil(L: *mut lua_State, n: c_int) -> c_int { unsafe {
-    (lua_type(L, n) == LUA_TNIL) as c_int
-}}
-
-#[inline(always)]
-pub unsafe fn lua_isboolean(L: *mut lua_State, n: c_int) -> c_int { unsafe {
-    (lua_type(L, n) == LUA_TBOOLEAN) as c_int
-}}
-
-#[inline(always)]
-pub unsafe fn lua_isthread(L: *mut lua_State, n: c_int) -> c_int { unsafe {
-    (lua_type(L, n) == LUA_TTHREAD) as c_int
-}}
-
-#[inline(always)]
-pub unsafe fn lua_isnone(L: *mut lua_State, n: c_int) -> c_int { unsafe {
-    (lua_type(L, n) == LUA_TNONE) as c_int
-}}
-
-#[inline(always)]
-pub unsafe fn lua_isnoneornil(L: *mut lua_State, n: c_int) -> c_int { unsafe {
-    (lua_type(L, n) <= 0) as c_int
-}}
-
-#[inline(always)]
-pub unsafe fn lua_pushliteral(L: *mut lua_State, s: &'static CStr) { unsafe {
-    lua_pushstring(L, s.as_ptr());
-}}
-
-#[inline(always)]
-pub unsafe fn lua_pushglobaltable(L: *mut lua_State) -> c_int { unsafe {
-    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS)
-}}
-
-#[inline(always)]
-pub unsafe fn lua_tolightuserdata(L: *mut lua_State, idx: c_int) -> *mut c_void { unsafe {
-    if lua_islightuserdata(L, idx) != 0 {
-        return lua_touserdata(L, idx);
+pub unsafe fn lua_register(L: *mut lua_State, n: *const c_char, f: lua_CFunction) {
+    unsafe {
+        lua_pushcfunction(L, f);
+        lua_setglobal(L, n)
     }
-    ptr::null_mut()
-}}
+}
 
 #[inline(always)]
-pub unsafe fn lua_tostring(L: *mut lua_State, i: c_int) -> *const c_char { unsafe {
-    lua_tolstring(L, i, ptr::null_mut())
-}}
+pub unsafe fn lua_pushcfunction(L: *mut lua_State, f: lua_CFunction) {
+    unsafe { lua_pushcclosure(L, f, 0) }
+}
 
 #[inline(always)]
-pub unsafe fn lua_insert(L: *mut lua_State, idx: c_int) { unsafe {
-    lua_rotate(L, idx, 1)
-}}
+pub unsafe fn lua_isfunction(L: *mut lua_State, n: c_int) -> c_int {
+    unsafe { (lua_type(L, n) == LUA_TFUNCTION) as c_int }
+}
 
 #[inline(always)]
-pub unsafe fn lua_remove(L: *mut lua_State, idx: c_int) { unsafe {
-    lua_rotate(L, idx, -1);
-    lua_pop(L, 1)
-}}
+pub unsafe fn lua_istable(L: *mut lua_State, n: c_int) -> c_int {
+    unsafe { (lua_type(L, n) == LUA_TTABLE) as c_int }
+}
 
 #[inline(always)]
-pub unsafe fn lua_replace(L: *mut lua_State, idx: c_int) { unsafe {
-    lua_copy(L, -1, idx);
-    lua_pop(L, 1)
-}}
+pub unsafe fn lua_islightuserdata(L: *mut lua_State, n: c_int) -> c_int {
+    unsafe { (lua_type(L, n) == LUA_TLIGHTUSERDATA) as c_int }
+}
 
 #[inline(always)]
-pub unsafe fn lua_xpush(from: *mut lua_State, to: *mut lua_State, idx: c_int) { unsafe {
-    lua_pushvalue(from, idx);
-    lua_xmove(from, to, 1);
-}}
+pub unsafe fn lua_isnil(L: *mut lua_State, n: c_int) -> c_int {
+    unsafe { (lua_type(L, n) == LUA_TNIL) as c_int }
+}
 
 #[inline(always)]
-pub unsafe fn lua_newuserdata(L: *mut lua_State, sz: usize) -> *mut c_void { unsafe {
-    lua_newuserdatauv(L, sz, 1)
-}}
+pub unsafe fn lua_isboolean(L: *mut lua_State, n: c_int) -> c_int {
+    unsafe { (lua_type(L, n) == LUA_TBOOLEAN) as c_int }
+}
 
 #[inline(always)]
-pub unsafe fn lua_getuservalue(L: *mut lua_State, idx: c_int) -> c_int { unsafe {
-    lua_getiuservalue(L, idx, 1)
-}}
+pub unsafe fn lua_isthread(L: *mut lua_State, n: c_int) -> c_int {
+    unsafe { (lua_type(L, n) == LUA_TTHREAD) as c_int }
+}
 
 #[inline(always)]
-pub unsafe fn lua_setuservalue(L: *mut lua_State, idx: c_int) -> c_int { unsafe {
-    lua_setiuservalue(L, idx, 1)
-}}
+pub unsafe fn lua_isnone(L: *mut lua_State, n: c_int) -> c_int {
+    unsafe { (lua_type(L, n) == LUA_TNONE) as c_int }
+}
+
+#[inline(always)]
+pub unsafe fn lua_isnoneornil(L: *mut lua_State, n: c_int) -> c_int {
+    unsafe { (lua_type(L, n) <= 0) as c_int }
+}
+
+#[inline(always)]
+pub unsafe fn lua_pushliteral(L: *mut lua_State, s: &'static CStr) {
+    unsafe {
+        lua_pushstring(L, s.as_ptr());
+    }
+}
+
+#[inline(always)]
+pub unsafe fn lua_pushglobaltable(L: *mut lua_State) -> c_int {
+    unsafe { lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS) }
+}
+
+#[inline(always)]
+pub unsafe fn lua_tolightuserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
+    unsafe {
+        if lua_islightuserdata(L, idx) != 0 {
+            return lua_touserdata(L, idx);
+        }
+        ptr::null_mut()
+    }
+}
+
+#[inline(always)]
+pub unsafe fn lua_tostring(L: *mut lua_State, i: c_int) -> *const c_char {
+    unsafe { lua_tolstring(L, i, ptr::null_mut()) }
+}
+
+#[inline(always)]
+pub unsafe fn lua_insert(L: *mut lua_State, idx: c_int) {
+    unsafe { lua_rotate(L, idx, 1) }
+}
+
+#[inline(always)]
+pub unsafe fn lua_remove(L: *mut lua_State, idx: c_int) {
+    unsafe {
+        lua_rotate(L, idx, -1);
+        lua_pop(L, 1)
+    }
+}
+
+#[inline(always)]
+pub unsafe fn lua_replace(L: *mut lua_State, idx: c_int) {
+    unsafe {
+        lua_copy(L, -1, idx);
+        lua_pop(L, 1)
+    }
+}
+
+#[inline(always)]
+pub unsafe fn lua_xpush(from: *mut lua_State, to: *mut lua_State, idx: c_int) {
+    unsafe {
+        lua_pushvalue(from, idx);
+        lua_xmove(from, to, 1);
+    }
+}
+
+#[inline(always)]
+pub unsafe fn lua_newuserdata(L: *mut lua_State, sz: usize) -> *mut c_void {
+    unsafe { lua_newuserdatauv(L, sz, 1) }
+}
+
+#[inline(always)]
+pub unsafe fn lua_getuservalue(L: *mut lua_State, idx: c_int) -> c_int {
+    unsafe { lua_getiuservalue(L, idx, 1) }
+}
+
+#[inline(always)]
+pub unsafe fn lua_setuservalue(L: *mut lua_State, idx: c_int) -> c_int {
+    unsafe { lua_setiuservalue(L, idx, 1) }
+}
 
 //
 // Debug API
@@ -536,7 +582,10 @@ pub const LUA_MASKCOUNT: c_int = 1 << (LUA_HOOKCOUNT as usize);
 /// Type for functions to be called on debug events.
 pub type lua_Hook = unsafe extern "C-unwind" fn(L: *mut lua_State, ar: *mut lua_Debug);
 
-#[cfg_attr(all(windows, feature = "raw_dylib"), link(name = "lua55", kind = "raw-dylib"))]
+#[cfg_attr(
+    all(windows, feature = "raw_dylib"),
+    link(name = "lua55", kind = "raw-dylib")
+)]
 unsafe extern "C-unwind" {
     pub fn lua_getstack(L: *mut lua_State, level: c_int, ar: *mut lua_Debug) -> c_int;
     pub fn lua_getinfo(L: *mut lua_State, what: *const c_char, ar: *mut lua_Debug) -> c_int;

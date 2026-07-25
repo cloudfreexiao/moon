@@ -534,7 +534,10 @@ fn range_marker_registered_to_multiple_tiles() {
             }
         }
     }
-    assert!(tiles > 1, "range marker should span multiple tiles, got {tiles}");
+    assert!(
+        tiles > 1,
+        "range marker should span multiple tiles, got {tiles}"
+    );
 }
 
 #[test]
@@ -1325,7 +1328,16 @@ fn profile_flamegraph() {
             ins(&mut a, i as Handle, 2500, 2500, 1000, 1000, 0, W);
         }
         for i in 0..500i32 {
-            ins(&mut a, (1000 + i) as Handle, 2000 + (i % 50) * 20, 2000 + (i / 50) * 20, 0, 0, 0, M);
+            ins(
+                &mut a,
+                (1000 + i) as Handle,
+                2000 + (i % 50) * 20,
+                2000 + (i / 50) * 20,
+                0,
+                0,
+                0,
+                M,
+            );
         }
         profile("s8_hide_show", dur, &mut || {
             for i in 0..500i32 {
@@ -1354,7 +1366,16 @@ fn profile_flamegraph() {
         let mut a = Aoi::new(0, 0, 2000, 50);
         a.set_option(ENABLE_LEAVE_EVENT);
         for i in 1..=100i32 {
-            ins(&mut a, i as Handle, 1000 + (i % 10) * 5, 1000 + (i / 10) * 5, 600, 600, 0, W);
+            ins(
+                &mut a,
+                i as Handle,
+                1000 + (i % 10) * 5,
+                1000 + (i / 10) * 5,
+                600,
+                600,
+                0,
+                W,
+            );
         }
         ins(&mut a, 500, 1000, 1000, 0, 0, 0, M);
         let mut step = 0i64;
@@ -1373,10 +1394,28 @@ fn profile_flamegraph() {
         let mut a = Aoi::new(0, 0, 5000, 100);
         a.set_option(ENABLE_LEAVE_EVENT);
         for i in 0..200i64 {
-            ins(&mut a, i, ((i * 37) % 5000) as i32, ((i * 53) % 5000) as i32, 400, 400, 0, W);
+            ins(
+                &mut a,
+                i,
+                ((i * 37) % 5000) as i32,
+                ((i * 53) % 5000) as i32,
+                400,
+                400,
+                0,
+                W,
+            );
         }
         for i in 0..1000i64 {
-            ins(&mut a, 10000 + i, ((i * 41) % 5000) as i32, ((i * 67) % 5000) as i32, 0, 0, 0, M);
+            ins(
+                &mut a,
+                10000 + i,
+                ((i * 41) % 5000) as i32,
+                ((i * 67) % 5000) as i32,
+                0,
+                0,
+                0,
+                M,
+            );
         }
         let mut s = 0x9e3779b97f4a7c15u64;
         profile("s3_tick", dur, &mut || {
@@ -1404,10 +1443,28 @@ fn profile_flamegraph() {
         let mut a = Aoi::new(0, 0, 5000, 100);
         a.set_option(ENABLE_LEAVE_EVENT);
         for i in 0..100i32 {
-            ins(&mut a, i as Handle, 2500, 2500, 50 + i * 10, 50 + i * 10, 0, W);
+            ins(
+                &mut a,
+                i as Handle,
+                2500,
+                2500,
+                50 + i * 10,
+                50 + i * 10,
+                0,
+                W,
+            );
         }
         for i in 0..200i32 {
-            ins(&mut a, (1000 + i) as Handle, 2000 + (i * 17) % 1000, 2000 + (i * 31) % 1000, 0, 0, 0, M);
+            ins(
+                &mut a,
+                (1000 + i) as Handle,
+                2000 + (i * 17) % 1000,
+                2000 + (i * 31) % 1000,
+                0,
+                0,
+                0,
+                M,
+            );
         }
         let mut s = 0xd1b54a32d192ed03u64;
         profile("s22_mixed_view", dur, &mut || {
@@ -1462,13 +1519,40 @@ fn profile_flamegraph() {
     {
         let mut a = Aoi::new(0, 0, 5000, 100);
         for i in 0..500i32 {
-            ins(&mut a, i as Handle, (i * 41) % 5000, (i * 67) % 5000, 0, 0, 0, M);
+            ins(
+                &mut a,
+                i as Handle,
+                (i * 41) % 5000,
+                (i * 67) % 5000,
+                0,
+                0,
+                0,
+                M,
+            );
         }
         for i in 500..700i32 {
-            ins(&mut a, i as Handle, (i * 31) % 5000, (i * 53) % 5000, 200, 200, 0, W);
+            ins(
+                &mut a,
+                i as Handle,
+                (i * 31) % 5000,
+                (i * 53) % 5000,
+                200,
+                200,
+                0,
+                W,
+            );
         }
         for i in 700..800i32 {
-            ins(&mut a, i as Handle, (i * 23) % 5000, (i * 47) % 5000, 200, 200, 0, W | M);
+            ins(
+                &mut a,
+                i as Handle,
+                (i * 23) % 5000,
+                (i * 47) % 5000,
+                200,
+                200,
+                0,
+                W | M,
+            );
         }
         profile("s20_foreach", dur, &mut || {
             let mut acc = 0u64;
@@ -1483,7 +1567,16 @@ fn profile_flamegraph() {
     profile("s24_single_tile", dur, &mut || {
         let mut a = Aoi::new(0, 0, 1000, 1000);
         for i in 0..100i64 {
-            ins(&mut a, i, (i * 9) as i32, (i * 9) as i32, 500, 500, 0, W | M);
+            ins(
+                &mut a,
+                i,
+                (i * 9) as i32,
+                (i * 9) as i32,
+                500,
+                500,
+                0,
+                W | M,
+            );
         }
         a.clear_event();
         for i in 0..100i64 {

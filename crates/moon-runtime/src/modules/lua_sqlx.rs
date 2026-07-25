@@ -3,11 +3,11 @@ use crate::request_pool::{PendingCounter, QueuedRequest, drain_queued_requests};
 use dashmap::DashMap;
 use futures_util::TryStreamExt;
 use lazy_static::lazy_static;
-use moon_base::laux::LuaState;
+use moon_base::laux::{LuaStack, LuaState};
 use moon_base::{
     cstr, ffi, laux,
-    laux::{LuaArgs, LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib, push_lua_table,
+    laux::{LuaArgs, LuaTable, LuaType},
+    lreg, lreg_null, lreg_try, luaL_newlib, push_lua_table,
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
@@ -691,22 +691,23 @@ async fn database_handler(
 // Lua-facing functions
 // ---------------------------------------------------------------------------
 
-extern "C-unwind" fn connect(state: LuaState) -> c_int {
-    let database_url = unsafe { laux::lua_check_str(state, 1) };
-    let name = unsafe { laux::lua_check_str(state, 2) };
-    let connect_timeout: u64 = laux::lua_opt(state, 3).unwrap_or(5000);
-    let max_connections: u32 = laux::lua_opt(state, 4).unwrap_or(crate::LIMITS.db_pool_size);
-    let queue_capacity: usize =
-        laux::lua_opt(state, 5).unwrap_or(crate::LIMITS.request_queue_capacity);
+fn connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let database_url = lua
+        .get::<String>(1)
+        .map_err(|err| format!("sqlx.connect: {err}"))?;
+    let name = lua
+        .get::<String>(2)
+        .map_err(|err| format!("sqlx.connect: {err}"))?;
+    let connect_timeout: u64 = lua.opt(3).unwrap_or(5000);
+    let max_connections: u32 = lua.opt(4).unwrap_or(crate::LIMITS.db_pool_size);
+    let queue_capacity: usize = lua.opt(5).unwrap_or(crate::LIMITS.request_queue_capacity);
     let queue_capacity = queue_capacity.max(1);
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
     let session = unsafe { (*actor).next_session() };
     let protocol_type = context::PTYPE_SQLX;
-
-    let database_url = database_url.to_string();
-    let name = name.to_string();
 
     CONTEXT.io_runtime().spawn(async move {
         match DatabasePool::connect(
@@ -752,24 +753,26 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
 const SQLX_JSON_PARAM_META: *const std::ffi::c_char = cstr!("sqlx_json_param");
 
-extern "C-unwind" fn make_json_param(state: LuaState) -> c_int {
-    let str = unsafe { laux::lua_check_str(state, 1) };
-    let value: serde_json::Value = match serde_json::from_str(str) {
-        Ok(v) => v,
-        Err(e) => {
-            laux::lua_error(state, format!("sqlx.json: invalid JSON: {}", e));
-        }
+fn make_json_param(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let value: serde_json::Value = {
+        let source = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "sqlx.json: UTF-8 string expected".to_string())?;
+        serde_json::from_str(source).map_err(|e| format!("sqlx.json: invalid JSON: {e}"))?
     };
     laux::lua_newuserdata(state, value, SQLX_JSON_PARAM_META, &[lreg_null!()]);
-    1
+    Ok(1)
 }
 
-fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
+fn get_query_param(lua: &mut LuaStack<'_>, i: i32) -> Result<QueryParams, String> {
+    let state = lua.state();
     let options = JsonOptions::default();
 
     let ptr = unsafe { ffi::luaL_testudata(state.as_ptr(), i, SQLX_JSON_PARAM_META) };
@@ -778,20 +781,18 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
         return Ok(QueryParams::Json(value.clone()));
     }
 
-    let res = match LuaValue::from_stack(state, i) {
-        LuaValue::Boolean(val) => QueryParams::Bool(val),
-        LuaValue::Number(val) => QueryParams::Float(val),
-        LuaValue::Integer(val) => QueryParams::Int(val),
-        LuaValue::String(val) => match String::from_utf8(val.to_vec()) {
+    let value = lua.value(i);
+    let res = match value.kind() {
+        LuaType::Boolean => QueryParams::Bool(value.as_bool().unwrap_or(false)),
+        LuaType::Number => QueryParams::Float(value.as_number().unwrap_or_default()),
+        LuaType::Integer => QueryParams::Int(value.as_integer().unwrap_or_default()),
+        LuaType::String => match String::from_utf8(value.as_bytes().unwrap_or_default().to_vec()) {
             Ok(s) => QueryParams::Text(s),
             Err(e) => QueryParams::Bytes(e.into_bytes()),
         },
-        LuaValue::Table(val) => {
+        LuaType::Table => {
             let mut buffer = Vec::new();
-            if let Err(err) = encode_table(&mut buffer, &val, 0, false, &options) {
-                drop(buffer);
-                laux::lua_error(state, err);
-            }
+            encode_table(&mut buffer, lua, i, 0, false, &options)?;
             if !buffer.is_empty() && (buffer[0] == b'{' || buffer[0] == b'[') {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(buffer.as_slice()) {
                     QueryParams::Json(value)
@@ -805,36 +806,40 @@ fn get_query_param(state: LuaState, i: i32) -> Result<QueryParams, String> {
         _ => {
             return Err(format!(
                 "get_query_param: unsupported value type: {}",
-                laux::type_name(state, i)
+                value.name()
             ));
         }
     };
     Ok(res)
 }
 
-extern "C-unwind" fn query(state: LuaState) -> c_int {
-    query_impl(state, false)
+fn query(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    query_impl(lua, false)
 }
-extern "C-unwind" fn exec_query(state: LuaState) -> c_int {
-    query_impl(state, true)
+fn exec_query(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    query_impl(lua, true)
 }
 
-fn query_impl(state: LuaState, forget: bool) -> c_int {
+fn query_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
+    let state = lua.state();
     let mut args = LuaArgs::new(1);
-    let conn =
-        laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg()).unwrap_or_else(|| {
-            laux::lua_error(state, "invalid database connection pointer".to_string())
-        });
+    let conn_ptr = lua
+        .value(args.iter_arg())
+        .as_userdata::<DatabaseConnection>()
+        .ok_or_else(|| "invalid database connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
 
-    let sql = unsafe { laux::lua_check_str(state, args.iter_arg()) };
+    let sql = lua
+        .get::<String>(args.iter_arg())
+        .map_err(|err| format!("sqlx.query: {err}"))?;
     let mut params = Vec::new();
     let top = laux::lua_top(state);
     for i in args.iter_arg()..=top {
-        match get_query_param(state, i) {
+        match get_query_param(lua, i) {
             Ok(value) => params.push(value),
             Err(err) => {
                 push_lua_table!(state, "kind" => "ERROR", "message" => err);
-                return 1;
+                return Ok(1);
             }
         }
     }
@@ -850,10 +855,7 @@ fn query_impl(state: LuaState, forget: bool) -> c_int {
     match conn.tx.try_send(DatabaseRequest::Query(
         owner,
         session,
-        DatabaseQuery {
-            sql: sql.to_string(),
-            binds: params,
-        },
+        DatabaseQuery { sql, binds: params },
     )) {
         Ok(_) => {
             conn.counter.inc();
@@ -862,27 +864,30 @@ fn query_impl(state: LuaState, forget: bool) -> c_int {
             } else {
                 laux::lua_push(state, session);
             }
-            1
+            Ok(1)
         }
         Err(err) => {
             push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
-            1
+            Ok(1)
         }
     }
 }
 
-extern "C-unwind" fn query_stream(state: LuaState) -> c_int {
+fn query_stream(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     let mut args = LuaArgs::new(1);
-    let conn =
-        laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg()).unwrap_or_else(|| {
-            laux::lua_error(state, "invalid database connection pointer".to_string())
-        });
+    let conn_ptr = lua
+        .value(args.iter_arg())
+        .as_userdata::<DatabaseConnection>()
+        .ok_or_else(|| "invalid database connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
 
     // Parse as i64 so a negative Lua integer is rejected rather than wrapping
     // to a huge `usize`. `batch_size == 0` would make the stream handler emit
     // empty batches forever, so require >= 1.
-    let batch_size: i64 =
-        laux::lua_opt(state, args.iter_arg()).unwrap_or(crate::LIMITS.db_stream_batch_rows);
+    let batch_size: i64 = lua
+        .opt(args.iter_arg())
+        .unwrap_or(crate::LIMITS.db_stream_batch_rows);
     if batch_size < 1 || batch_size as u64 > crate::LIMITS.db_query_rows as u64 {
         push_lua_table!(
             state,
@@ -892,18 +897,20 @@ extern "C-unwind" fn query_stream(state: LuaState) -> c_int {
                 crate::LIMITS.db_query_rows
             )
         );
-        return 1;
+        return Ok(1);
     }
     let batch_size = batch_size as usize;
-    let sql = unsafe { laux::lua_check_str(state, args.iter_arg()) };
+    let sql = lua
+        .get::<String>(args.iter_arg())
+        .map_err(|err| format!("sqlx.query_stream: {err}"))?;
     let mut params = Vec::new();
     let top = laux::lua_top(state);
     for i in args.iter_arg()..=top {
-        match get_query_param(state, i) {
+        match get_query_param(lua, i) {
             Ok(value) => params.push(value),
             Err(err) => {
                 push_lua_table!(state, "kind" => "ERROR", "message" => err);
-                return 1;
+                return Ok(1);
             }
         }
     }
@@ -915,80 +922,83 @@ extern "C-unwind" fn query_stream(state: LuaState) -> c_int {
     match conn.tx.try_send(DatabaseRequest::QueryStream(
         owner,
         session,
-        DatabaseQuery {
-            sql: sql.to_string(),
-            binds: params,
-        },
+        DatabaseQuery { sql, binds: params },
         batch_size,
     )) {
         Ok(_) => {
             conn.counter.inc();
             laux::lua_push(state, session);
-            1
+            Ok(1)
         }
         Err(err) => {
             push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
-            1
+            Ok(1)
         }
     }
 }
 
-extern "C-unwind" fn push_transaction_query(state: LuaState) -> c_int {
-    let queries = laux::lua_touserdata::<TransactionQueries>(state, 1).unwrap_or_else(|| {
-        laux::lua_error(state, "invalid transaction queries pointer".to_string())
-    });
+fn push_transaction_query(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut queries_ptr = lua
+        .value(1)
+        .as_userdata::<TransactionQueries>()
+        .ok_or_else(|| "invalid transaction queries pointer".to_string())?;
 
-    let sql = unsafe { laux::lua_check_str(state, 2) };
+    let sql = lua
+        .get::<String>(2)
+        .map_err(|err| format!("sqlx.transaction.push: {err}"))?;
     let mut params = Vec::new();
     let top = laux::lua_top(state);
     for i in 3..=top {
-        match get_query_param(state, i) {
+        match get_query_param(lua, i) {
             Ok(value) => params.push(value),
             Err(err) => {
                 drop(params);
-                laux::lua_error(state, err);
+                return Err(err);
             }
         }
     }
 
-    queries.queries.push(DatabaseQuery {
-        sql: sql.to_string(),
-        binds: params,
-    });
+    unsafe { queries_ptr.as_mut() }
+        .queries
+        .push(DatabaseQuery { sql, binds: params });
 
-    0
+    Ok(0)
 }
 
-extern "C-unwind" fn make_transaction(state: LuaState) -> c_int {
+fn make_transaction(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     laux::lua_newuserdata(
         state,
         TransactionQueries {
             queries: Vec::new(),
         },
         cstr!("sqlx_transaction_metatable"),
-        &[lreg!("push", push_transaction_query), lreg_null!()],
+        &[lreg_try!("push", push_transaction_query), lreg_null!()],
     );
     1
 }
 
-extern "C-unwind" fn transaction(state: LuaState) -> c_int {
-    transaction_impl(state, false)
+fn transaction(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    transaction_impl(lua, false)
 }
-extern "C-unwind" fn exec_transaction(state: LuaState) -> c_int {
-    transaction_impl(state, true)
+fn exec_transaction(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    transaction_impl(lua, true)
 }
 
-fn transaction_impl(state: LuaState, forget: bool) -> c_int {
+fn transaction_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
+    let state = lua.state();
     let mut args = LuaArgs::new(1);
-    let conn =
-        laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg()).unwrap_or_else(|| {
-            laux::lua_error(state, "invalid database connection pointer".to_string())
-        });
+    let conn_ptr = lua
+        .value(args.iter_arg())
+        .as_userdata::<DatabaseConnection>()
+        .ok_or_else(|| "invalid database connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
 
-    let queries = laux::lua_touserdata::<TransactionQueries>(state, args.iter_arg())
-        .unwrap_or_else(|| {
-            laux::lua_error(state, "invalid transaction queries pointer".to_string())
-        });
+    let mut queries_ptr = lua
+        .value(args.iter_arg())
+        .as_userdata::<TransactionQueries>()
+        .ok_or_else(|| "invalid transaction queries pointer".to_string())?;
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -1001,7 +1011,7 @@ fn transaction_impl(state: LuaState, forget: bool) -> c_int {
     match conn.tx.try_send(DatabaseRequest::Transaction(
         owner,
         session,
-        std::mem::take(&mut queries.queries),
+        std::mem::take(&mut unsafe { queries_ptr.as_mut() }.queries),
     )) {
         Ok(_) => {
             conn.counter.inc();
@@ -1010,67 +1020,83 @@ fn transaction_impl(state: LuaState, forget: bool) -> c_int {
             } else {
                 laux::lua_push(state, session);
             }
-            1
+            Ok(1)
         }
         Err(err) => {
             push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
-            1
+            Ok(1)
         }
     }
 }
 
-extern "C-unwind" fn close(state: LuaState) -> c_int {
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1).unwrap_or_else(|| {
-        laux::lua_error(state, "invalid database connection pointer".to_string())
-    });
+fn close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let conn_ptr = lua
+        .value(1)
+        .as_userdata::<DatabaseConnection>()
+        .ok_or_else(|| "invalid database connection pointer".to_string())?;
+    let conn = unsafe { conn_ptr.as_ref() };
 
     match conn.tx.try_send(DatabaseRequest::Close()) {
         Ok(_) => {
             laux::lua_push(state, true);
-            1
+            Ok(1)
         }
         Err(err) => {
             push_lua_table!(state, "kind" => "ERROR", "message" => err.to_string());
-            1
+            Ok(1)
         }
     }
 }
 
-extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
-    let name = unsafe { laux::lua_check_str(state, 1) };
-    match DATABASE_CONNECTIONS.get(name) {
-        Some(pair) => {
+fn find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let connection = {
+        let name = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "sqlx.find_connection: UTF-8 string expected".to_string())?;
+        DATABASE_CONNECTIONS
+            .get(name)
+            .map(|pair| pair.value().clone())
+    };
+    match connection {
+        Some(connection) => {
             let l = [
-                lreg!("query", query),
-                lreg!("exec_query", exec_query),
-                lreg!("query_stream", query_stream),
-                lreg!("transaction", transaction),
-                lreg!("exec_transaction", exec_transaction),
-                lreg!("close", close),
+                lreg_try!("query", query),
+                lreg_try!("exec_query", exec_query),
+                lreg_try!("query_stream", query_stream),
+                lreg_try!("transaction", transaction),
+                lreg_try!("exec_transaction", exec_transaction),
+                lreg_try!("close", close),
                 lreg_null!(),
             ];
             if laux::lua_newuserdata(
                 state,
-                pair.value().clone(),
+                connection,
                 cstr!("sqlx_connection_metatable"),
                 l.as_ref(),
             )
             .is_none()
             {
                 laux::lua_pushnil(state);
-                return 1;
+                return Ok(1);
             }
         }
         None => {
             laux::lua_pushnil(state);
         }
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn sqlx_cursor_next(state: LuaState) -> c_int {
-    let handle = laux::lua_touserdata::<SqlxCursorHandle>(state, 1)
-        .unwrap_or_else(|| laux::lua_error(state, "invalid sqlx cursor handle".to_string()));
+fn sqlx_cursor_next(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let mut handle_ptr = lua
+        .value(1)
+        .as_userdata::<SqlxCursorHandle>()
+        .ok_or_else(|| "invalid sqlx cursor handle".to_string())?;
+    let handle = unsafe { handle_ptr.as_mut() };
     if let Some(tx) = handle.0.take() {
         let actor = LuaActor::from_lua_state(state);
         let owner = unsafe { (*actor).id };
@@ -1079,29 +1105,38 @@ extern "C-unwind" fn sqlx_cursor_next(state: LuaState) -> c_int {
         // send fails. Surface that as an error rather than pushing a session that
         // would never be answered (which would hang the awaiting coroutine).
         if tx.send(CursorSignal::Next(owner, session)).is_err() {
-            return crate::lua_push_error(state, "sqlx cursor: stream handler is gone");
+            return Ok(crate::lua_push_error_tuple(
+                state,
+                "sqlx cursor: stream handler is gone",
+            ));
         }
         laux::lua_push(state, session);
-        1
+        Ok(1)
     } else {
-        crate::lua_push_error(state, "sqlx cursor: already consumed or closed")
+        Ok(crate::lua_push_error_tuple(
+            state,
+            "sqlx cursor: already consumed or closed",
+        ))
     }
 }
 
-extern "C-unwind" fn sqlx_cursor_close(state: LuaState) -> c_int {
-    let handle = laux::lua_touserdata::<SqlxCursorHandle>(state, 1)
-        .unwrap_or_else(|| laux::lua_error(state, "invalid sqlx cursor handle".to_string()));
+fn sqlx_cursor_close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let mut handle_ptr = lua
+        .value(1)
+        .as_userdata::<SqlxCursorHandle>()
+        .ok_or_else(|| "invalid sqlx cursor handle".to_string())?;
+    let handle = unsafe { handle_ptr.as_mut() };
     if let Some(tx) = handle.0.take() {
         let _ = tx.send(CursorSignal::Close);
     }
-    0
+    Ok(0)
 }
 
 fn push_cursor_handle(state: LuaState, next_tx: Option<oneshot::Sender<CursorSignal>>) {
     if let Some(tx) = next_tx {
         let methods = [
-            lreg!("next", sqlx_cursor_next),
-            lreg!("close", sqlx_cursor_close),
+            lreg_try!("next", sqlx_cursor_next),
+            lreg_try!("close", sqlx_cursor_close),
             lreg_null!(),
         ];
         laux::lua_newuserdata(
@@ -1160,7 +1195,8 @@ fn push_sqlx_response(state: LuaState, result: DatabaseResponse) -> c_int {
     }
 }
 
-extern "C-unwind" fn stats(state: LuaState) -> c_int {
+fn stats(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     let table = LuaTable::new(state, 0, DATABASE_CONNECTIONS.len());
     DATABASE_CONNECTIONS.iter().for_each(|pair| {
         let counter = &pair.value().counter;
@@ -1183,17 +1219,17 @@ pub unsafe extern "C-unwind" fn decode_sqlx_message(
 ) -> c_int {
     match unsafe { crate::message_decode::take_boxed::<DatabaseResponse>(m) } {
         Ok(response) => push_sqlx_response(state, response),
-        Err(e) => crate::lua_push_error(state, &e),
+        Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
 
 pub extern "C-unwind" fn luaopen_sqlx(state: LuaState) -> c_int {
     let l = [
-        lreg!("connect", connect),
-        lreg!("find_connection", find_connection),
+        lreg_try!("connect", connect),
+        lreg_try!("find_connection", find_connection),
         lreg!("stats", stats),
         lreg!("make_transaction", make_transaction),
-        lreg!("json_param", make_json_param),
+        lreg_try!("json_param", make_json_param),
         lreg_null!(),
     ];
 

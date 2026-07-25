@@ -456,8 +456,7 @@ impl LuaActorServer {
     }
 
     pub fn set_env(&self, key: &str, value: &[u8]) {
-        self.env
-            .insert(key.to_string(), Arc::new(value.to_vec()));
+        self.env.insert(key.to_string(), Arc::new(value.to_vec()));
     }
 
     pub fn set_module_loader(&self, loader: Arc<dyn LuaModuleLoader>) {
@@ -627,7 +626,9 @@ impl LuaActorServer {
     }
 
     pub fn now(&self) -> DateTime<Utc> {
-        self.now + self.now_clock() + Duration::from_millis(self.time_offset.load(Ordering::Acquire))
+        self.now
+            + self.now_clock()
+            + Duration::from_millis(self.time_offset.load(Ordering::Acquire))
     }
 
     /// Advance the simulated clock by `offset` milliseconds. The offset is
@@ -840,7 +841,12 @@ impl LuaActorServer {
             .iter()
             .map(|e| {
                 let wd = &e.value().watchdog;
-                (*e.key(), wd.memory() as u64, wd.message_total(), wd.cpu_ms_total())
+                (
+                    *e.key(),
+                    wd.memory() as u64,
+                    wd.message_total(),
+                    wd.cpu_ms_total(),
+                )
             })
             .collect();
         // O(1) reverse lookup instead of O(N×M) inner scan per actor.

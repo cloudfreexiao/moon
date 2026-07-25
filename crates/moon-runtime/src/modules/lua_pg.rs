@@ -23,11 +23,11 @@ use crate::request_pool::{
 };
 use dashmap::DashMap;
 use lazy_static::lazy_static;
-use moon_base::laux::LuaState;
+use moon_base::laux::{LuaStack, LuaState};
 use moon_base::{
     cstr, ffi, laux,
-    laux::{LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib, push_lua_table,
+    laux::{LuaTable, LuaType},
+    lreg, lreg_null, lreg_try, luaL_newlib, push_lua_table,
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
@@ -816,14 +816,15 @@ fn end_message(buf: &mut [u8], stub: usize) {
 /// Write a single Bind parameter value (text format) read from `idx`.
 fn write_param(
     buf: &mut Vec<u8>,
-    state: LuaState,
+    lua: &mut LuaStack<'_>,
     idx: i32,
     options: &JsonOptions,
 ) -> Result<(), String> {
-    let val = LuaValue::from_stack(state, idx);
-    let is_null = matches!(val, LuaValue::Nil)
-        || matches!(val, LuaValue::None)
-        || matches!(val, LuaValue::LightUserData(p) if p.is_null());
+    let value = lua.value(idx);
+    let kind = value.kind();
+    let is_null = matches!(kind, LuaType::Nil | LuaType::None)
+        || (kind == LuaType::LightUserData
+            && value.as_light_userdata().is_some_and(|ptr| ptr.is_null()));
     if is_null {
         buf.extend_from_slice(&(-1i32).to_be_bytes());
         return Ok(());
@@ -831,16 +832,28 @@ fn write_param(
 
     let stub = buf.len();
     buf.extend_from_slice(&[0u8; 4]); // length placeholder
-    match val {
-        LuaValue::Integer(v) => buf.extend_from_slice(v.to_string().as_bytes()),
-        LuaValue::Number(v) => buf.extend_from_slice(v.to_string().as_bytes()),
-        LuaValue::Boolean(v) => buf.extend_from_slice(if v { b"true" } else { b"false" }),
-        LuaValue::String(s) => buf.extend_from_slice(s),
-        LuaValue::Table(t) => {
-            encode_table(buf, &t, 0, false, options)?;
+    match kind {
+        LuaType::Integer => buf.extend_from_slice(
+            value
+                .as_integer()
+                .unwrap_or_default()
+                .to_string()
+                .as_bytes(),
+        ),
+        LuaType::Number => {
+            buf.extend_from_slice(value.as_number().unwrap_or_default().to_string().as_bytes())
         }
-        other => {
-            return Err(format!("unsupported parameter type: {}", other.name()));
+        LuaType::Boolean => buf.extend_from_slice(if value.as_bool().unwrap_or(false) {
+            b"true"
+        } else {
+            b"false"
+        }),
+        LuaType::String => buf.extend_from_slice(value.as_bytes().unwrap_or_default()),
+        LuaType::Table => {
+            encode_table(buf, lua, idx, 0, false, options)?;
+        }
+        _ => {
+            return Err(format!("unsupported parameter type: {}", value.name()));
         }
     }
     let size = (buf.len() - stub - 4) as u32;
@@ -854,7 +867,7 @@ fn write_param(
 /// format); empty for the implicit BEGIN/COMMIT statements.
 fn append_statement(
     buf: &mut Vec<u8>,
-    state: LuaState,
+    lua: &mut LuaStack<'_>,
     sql: &[u8],
     param_indices: &[i32],
     options: &JsonOptions,
@@ -883,7 +896,7 @@ fn append_statement(
     buf.extend_from_slice(&0u16.to_be_bytes()); // parameter format codes (0 => text)
     buf.extend_from_slice(&(param_indices.len() as u16).to_be_bytes());
     for &i in param_indices {
-        write_param(buf, state, i, options)?;
+        write_param(buf, lua, i, options)?;
     }
     buf.extend_from_slice(&1u16.to_be_bytes()); // one result format code
     buf.extend_from_slice(&0u16.to_be_bytes()); // text
@@ -931,7 +944,7 @@ const MAX_MESSAGE_LEN: usize = crate::LIMITS.db_wire_message_bytes;
 /// `build_sql(tuple_count)` returns the SQL whose placeholders are `$1..$N`
 /// (N = tuple_count * cols_per_tuple), numbered row-major.
 fn encode_many(
-    state: LuaState,
+    lua: &mut LuaStack<'_>,
     buf: &mut Vec<u8>,
     rows_idx: i32,
     nrows: usize,
@@ -939,6 +952,7 @@ fn encode_many(
     options: &JsonOptions,
     build_sql: &dyn Fn(usize) -> String,
 ) -> Result<(), String> {
+    let state = lua.state();
     if cols_per_tuple > MAX_BIND_PARAMS {
         return Err(format!(
             "too many columns per row ({cols_per_tuple}); max is {MAX_BIND_PARAMS}"
@@ -949,7 +963,7 @@ fn encode_many(
     let multi = total_chunks > 1;
 
     if multi {
-        append_statement(buf, state, b"BEGIN", &[], options)?;
+        append_statement(buf, lua, b"BEGIN", &[], options)?;
     }
 
     let mut parsed_len = 0usize; // tuple count currently held by the unnamed stmt
@@ -989,7 +1003,7 @@ fn encode_many(
             for c in 1..=cols_per_tuple {
                 unsafe { ffi::lua_rawgeti(state.as_ptr(), row_top, c as ffi::lua_Integer) };
                 let vtop = laux::lua_top(state);
-                let res = write_param(buf, state, vtop, options);
+                let res = write_param(buf, lua, vtop, options);
                 laux::lua_pop(state, 1); // value
                 if let Err(e) = res {
                     laux::lua_pop(state, 1); // row table
@@ -1018,7 +1032,7 @@ fn encode_many(
     }
 
     if multi {
-        append_statement(buf, state, b"COMMIT", &[], options)?;
+        append_statement(buf, lua, b"COMMIT", &[], options)?;
     }
     append_sync(buf);
     Ok(())
@@ -1089,7 +1103,7 @@ fn build_conflict_from_table(state: LuaState, idx: i32) -> Result<String, String
     // --- conflict target: `constraint` name or `columns` list (not both) ---
     unsafe { ffi::lua_getfield(state.as_ptr(), idx, cstr!("constraint")) };
     let constraint = if laux::lua_type(state, -1) == laux::LuaType::String {
-        Some(unsafe { laux::lua_check_str(state, -1) }.to_string())
+        Some(stack_string(state, -1, "conflict.constraint")?)
     } else {
         None
     };
@@ -1170,7 +1184,7 @@ fn parse_conflict(state: LuaState, idx: i32) -> Result<Option<String>, String> {
         laux::LuaType::None | laux::LuaType::Nil => Ok(None),
         laux::LuaType::Table => Ok(Some(build_conflict_from_table(state, idx)?)),
         laux::LuaType::String => {
-            let cf = unsafe { laux::lua_check_str(state, idx) }.to_string();
+            let cf = stack_string(state, idx, "conflict")?;
             validate_conflict_clause(&cf)?;
             Ok(Some(cf))
         }
@@ -1308,11 +1322,24 @@ fn read_string_array(state: LuaState, idx: i32, what: &str) -> Result<Vec<String
             laux::lua_pop(state, 1);
             return Err(format!("{}[{}] must be a string", what, i));
         }
-        let s = unsafe { laux::lua_check_str(state, top) }.to_string();
+        let s = stack_string(state, top, what)?;
         laux::lua_pop(state, 1);
         out.push(s);
     }
     Ok(out)
+}
+
+fn stack_string(state: LuaState, index: i32, what: &str) -> Result<String, String> {
+    if laux::lua_type(state, index) != LuaType::String {
+        return Err(format!("{} must be a string", what));
+    }
+    let mut len = 0;
+    let ptr = unsafe { ffi::lua_tolstring(state.as_ptr(), index, &mut len) };
+    if ptr.is_null() {
+        return Err(format!("{} must be a string", what));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,8 +1348,11 @@ fn read_string_array(state: LuaState, idx: i32, what: &str) -> Result<Vec<String
 
 const PG_POOL_META: *const std::ffi::c_char = cstr!("pg_pool_metatable");
 
-extern "C-unwind" fn connect(state: LuaState) -> c_int {
-    let database_url = unsafe { laux::lua_check_str(state, 1) }.to_string();
+fn connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let database_url = lua
+        .get::<String>(1)
+        .map_err(|err| format!("pg.connect: {err}"))?;
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -1392,37 +1422,42 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
-    let name = unsafe { laux::lua_check_str(state, 1) };
-    match PG_CONNECTIONS.get(name) {
-        Some(pair) => {
+fn find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let pool = {
+        let name = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "pg.find_connection: UTF-8 string expected".to_string())?;
+        PG_CONNECTIONS.get(name).map(|pair| pair.value().clone())
+    };
+    match pool {
+        Some(pool) => {
             let methods = [
                 lreg!("query", query),
                 lreg!("query_params", query_params),
-                lreg!("pipe", pipe),
-                lreg!("insert_many", insert_many),
-                lreg!("update_many", update_many),
+                lreg_try!("pipe", pipe),
+                lreg_try!("insert_many", insert_many),
+                lreg_try!("update_many", update_many),
                 lreg!("exec_query", exec_query),
                 lreg!("exec_query_params", exec_query_params),
-                lreg!("exec_pipe", exec_pipe),
-                lreg!("exec_insert_many", exec_insert_many),
-                lreg!("exec_update_many", exec_update_many),
+                lreg_try!("exec_pipe", exec_pipe),
+                lreg_try!("exec_insert_many", exec_insert_many),
+                lreg_try!("exec_update_many", exec_update_many),
                 lreg!("len", pool_len),
                 lreg!("close", close),
                 lreg_null!(),
             ];
-            if laux::lua_newuserdata(state, pair.value().clone(), PG_POOL_META, methods.as_ref())
-                .is_none()
-            {
+            if laux::lua_newuserdata(state, pool, PG_POOL_META, methods.as_ref()).is_none() {
                 laux::lua_pushnil(state);
             }
         }
         None => laux::lua_pushnil(state),
     }
-    1
+    Ok(1)
 }
 
 fn dispatch_async(state: LuaState, pool: &PgPool, data: Vec<u8>) -> c_int {
@@ -1462,16 +1497,21 @@ fn dispatch_forget(state: LuaState, pool: &PgPool, data: Vec<u8>) -> c_int {
 /// caller-controlled SQL. Never build it from untrusted input — use the
 /// extended-protocol helpers (`query_params`, `insert_many`, ...) with bound
 /// parameters for anything that includes user data.
-extern "C-unwind" fn query(state: LuaState) -> c_int {
-    query_impl(state, false)
+fn query(lua: &mut LuaStack<'_>) -> c_int {
+    query_impl(lua, false)
 }
-extern "C-unwind" fn exec_query(state: LuaState) -> c_int {
-    query_impl(state, true)
+fn exec_query(lua: &mut LuaStack<'_>) -> c_int {
+    query_impl(lua, true)
 }
 
-fn query_impl(state: LuaState, forget: bool) -> c_int {
-    let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
-    let sql = unsafe { laux::lua_check_lstring(state, 2) };
+fn query_impl(lua: &mut LuaStack<'_>, forget: bool) -> c_int {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<PgPool>()
+        .expect("invalid pg pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
+    let sql = lua.value(2).as_bytes().unwrap_or_default();
 
     let mut data = Vec::with_capacity(sql.len() + 6);
     data.push(b'Q');
@@ -1487,24 +1527,38 @@ fn query_impl(state: LuaState, forget: bool) -> c_int {
 }
 
 /// `handle:query_params(sql, ...)` — extended protocol with binds.
-extern "C-unwind" fn query_params(state: LuaState) -> c_int {
-    query_params_impl(state, false)
+fn query_params(lua: &mut LuaStack<'_>) -> c_int {
+    query_params_impl(lua, false)
 }
-extern "C-unwind" fn exec_query_params(state: LuaState) -> c_int {
-    query_params_impl(state, true)
+fn exec_query_params(lua: &mut LuaStack<'_>) -> c_int {
+    query_params_impl(lua, true)
 }
 
-fn query_params_impl(state: LuaState, forget: bool) -> c_int {
-    let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
+fn query_params_impl(lua: &mut LuaStack<'_>, forget: bool) -> c_int {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<PgPool>()
+        .expect("invalid pg pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
     let sql_idx = 2;
-    let sql = unsafe { laux::lua_check_lstring(state, sql_idx) }.to_vec();
+    // SAFETY: the SQL argument is rooted at an absolute stack slot for this
+    // call. `append_statement` only appends temporary values above it and does
+    // not replace, remove, or reorder the source slot.
+    let (sql_ptr, sql_len) = {
+        let sql = unsafe { lua.value_bytes_append_only(sql_idx).unwrap_or_default() };
+        (sql.as_ptr(), sql.len())
+    };
+    // The source slot remains rooted and append-only throughout this helper;
+    // use the stable Lua string pointer instead of allocating a Rust copy.
+    let sql = unsafe { std::slice::from_raw_parts(sql_ptr, sql_len) };
 
     let top = laux::lua_top(state);
     let param_indices: Vec<i32> = ((sql_idx + 1)..=top).collect();
 
     let options = JsonOptions::default();
     let mut data = Vec::with_capacity(64 + sql.len());
-    if let Err(err) = append_statement(&mut data, state, &sql, &param_indices, &options) {
+    if let Err(err) = append_statement(&mut data, lua, sql, &param_indices, &options) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
         return 1;
     }
@@ -1518,24 +1572,30 @@ fn query_params_impl(state: LuaState, forget: bool) -> c_int {
 }
 
 /// `handle:pipe({ {sql, p1, ...}, ... })` — pipelined transaction.
-extern "C-unwind" fn pipe(state: LuaState) -> c_int {
-    pipe_impl(state, false)
+fn pipe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    pipe_impl(lua, false)
 }
-extern "C-unwind" fn exec_pipe(state: LuaState) -> c_int {
-    pipe_impl(state, true)
+fn exec_pipe(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    pipe_impl(lua, true)
 }
 
-fn pipe_impl(state: LuaState, forget: bool) -> c_int {
-    let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
+fn pipe_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<PgPool>()
+        .expect("invalid pg pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
     let queries_idx = laux::lua_absindex(state, 2);
-    laux::lua_checktype(state, queries_idx, ffi::LUA_TTABLE);
+    laux::lua_checktype(state, queries_idx, ffi::LUA_TTABLE)
+        .map_err(|err| format!("pg.pipe: argument #2 {err}"))?;
 
     let options = JsonOptions::default();
     let mut data = Vec::with_capacity(256);
 
-    if let Err(err) = append_statement(&mut data, state, b"BEGIN", &[], &options) {
+    if let Err(err) = append_statement(&mut data, lua, b"BEGIN", &[], &options) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
-        return 1;
+        return Ok(1);
     }
 
     let n = unsafe { ffi::lua_rawlen(state.as_ptr(), queries_idx) };
@@ -1545,13 +1605,19 @@ fn pipe_impl(state: LuaState, forget: bool) -> c_int {
         if laux::lua_type(state, stmt_idx) != laux::LuaType::Table {
             laux::lua_pop(state, 1);
             push_lua_table!(state, "code" => "ENCODE", "message" => format!("pipe: expected table at index {}", i));
-            return 1;
+            return Ok(1);
         }
 
         // sql = stmt[1]; params = stmt[2..]
         unsafe { ffi::lua_rawgeti(state.as_ptr(), stmt_idx, 1) };
         let sql_top = laux::lua_top(state);
-        let sql = unsafe { laux::lua_check_lstring(state, sql_top) }.to_vec();
+        // SAFETY: `sql_top` remains rooted until `append_statement` returns;
+        // that helper only appends temporary values above the source.
+        let (sql_ptr, sql_len) = {
+            let sql = unsafe { lua.value_bytes_append_only(sql_top).unwrap_or_default() };
+            (sql.as_ptr(), sql.len())
+        };
+        let sql = unsafe { std::slice::from_raw_parts(sql_ptr, sql_len) };
 
         let stmt_len = unsafe { ffi::lua_rawlen(state.as_ptr(), stmt_idx) };
         let mut param_tops = Vec::new();
@@ -1560,24 +1626,24 @@ fn pipe_impl(state: LuaState, forget: bool) -> c_int {
             param_tops.push(laux::lua_top(state));
         }
 
-        let res = append_statement(&mut data, state, &sql, &param_tops, &options);
+        let res = append_statement(&mut data, lua, sql, &param_tops, &options);
         laux::lua_pop(state, (param_tops.len() as i32) + 2);
         if let Err(err) = res {
             push_lua_table!(state, "code" => "ENCODE", "message" => err);
-            return 1;
+            return Ok(1);
         }
     }
 
-    if let Err(err) = append_statement(&mut data, state, b"COMMIT", &[], &options) {
+    if let Err(err) = append_statement(&mut data, lua, b"COMMIT", &[], &options) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
-        return 1;
+        return Ok(1);
     }
     append_sync(&mut data);
 
     if forget {
-        dispatch_forget(state, pool, data)
+        Ok(dispatch_forget(state, pool, data))
     } else {
-        dispatch_async(state, pool, data)
+        Ok(dispatch_async(state, pool, data))
     }
 }
 
@@ -1600,46 +1666,54 @@ fn pipe_impl(state: LuaState, forget: bool) -> c_int {
 ///
 /// Note: a single multi-row UPSERT cannot touch the same conflict key twice —
 /// de-duplicate keys (keep the latest) before calling.
-extern "C-unwind" fn insert_many(state: LuaState) -> c_int {
-    insert_many_impl(state, false)
+fn insert_many(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    insert_many_impl(lua, false)
 }
-extern "C-unwind" fn exec_insert_many(state: LuaState) -> c_int {
-    insert_many_impl(state, true)
+fn exec_insert_many(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    insert_many_impl(lua, true)
 }
 
-fn insert_many_impl(state: LuaState, forget: bool) -> c_int {
-    let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
-    let table = unsafe { laux::lua_check_str(state, 2) }.to_string();
+fn insert_many_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<PgPool>()
+        .expect("invalid pg pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
+    let table = lua
+        .get::<String>(2)
+        .map_err(|err| format!("pg.insert_many: {err}"))?;
 
     let columns = match read_string_array(state, 3, "insert_many: columns") {
         Ok(c) => c,
         Err(e) => {
             push_lua_table!(state, "code" => "ENCODE", "message" => e);
-            return 1;
+            return Ok(1);
         }
     };
     let rows_idx = 4;
-    laux::lua_checktype(state, rows_idx, ffi::LUA_TTABLE);
+    laux::lua_checktype(state, rows_idx, ffi::LUA_TTABLE)
+        .map_err(|err| format!("pg.insert_many: rows {err}"))?;
     let nrows = unsafe { ffi::lua_rawlen(state.as_ptr(), rows_idx) };
     if nrows == 0 {
         push_lua_table!(state, "code" => "ENCODE", "message" => "insert_many: rows is empty");
-        return 1;
+        return Ok(1);
     }
     let conflict: Option<String> = match parse_conflict(state, 5) {
         Ok(c) => c,
         Err(e) => {
             push_lua_table!(state, "code" => "ENCODE", "message" => format!("insert_many: {}", e));
-            return 1;
+            return Ok(1);
         }
     };
 
-    laux::lua_checkstack(state, 4, std::ptr::null());
+    laux::lua_checkstack(state, 4, std::ptr::null())?;
     let options = JsonOptions::default();
     let mut data = Vec::with_capacity(128 + table.len() + nrows * columns.len() * 8);
     let build =
         |tuple_count: usize| build_insert_sql(&table, &columns, tuple_count, conflict.as_deref());
     if let Err(err) = encode_many(
-        state,
+        lua,
         &mut data,
         rows_idx,
         nrows,
@@ -1648,13 +1722,13 @@ fn insert_many_impl(state: LuaState, forget: bool) -> c_int {
         &build,
     ) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
-        return 1;
+        return Ok(1);
     }
 
     if forget {
-        dispatch_forget(state, pool, data)
+        Ok(dispatch_forget(state, pool, data))
     } else {
-        dispatch_async(state, pool, data)
+        Ok(dispatch_async(state, pool, data))
     }
 }
 
@@ -1666,44 +1740,56 @@ fn insert_many_impl(state: LuaState, forget: bool) -> c_int {
 /// `key_type` (e.g. "bigint") casts the join key param so the table's index on
 /// `key_column` stays usable; omit it and the key column is compared as text
 /// (works for any type, but no index).
-extern "C-unwind" fn update_many(state: LuaState) -> c_int {
-    update_many_impl(state, false)
+fn update_many(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    update_many_impl(lua, false)
 }
-extern "C-unwind" fn exec_update_many(state: LuaState) -> c_int {
-    update_many_impl(state, true)
+fn exec_update_many(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    update_many_impl(lua, true)
 }
 
-fn update_many_impl(state: LuaState, forget: bool) -> c_int {
-    let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
-    let table = unsafe { laux::lua_check_str(state, 2) }.to_string();
-    let key = unsafe { laux::lua_check_str(state, 3) }.to_string();
+fn update_many_impl(lua: &mut LuaStack<'_>, forget: bool) -> Result<c_int, String> {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<PgPool>()
+        .expect("invalid pg pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
+    let table = lua
+        .get::<String>(2)
+        .map_err(|err| format!("pg.update_many: {err}"))?;
+    let key = lua
+        .get::<String>(3)
+        .map_err(|err| format!("pg.update_many: {err}"))?;
 
     let set_cols = match read_string_array(state, 4, "update_many: set_columns") {
         Ok(c) => c,
         Err(e) => {
             push_lua_table!(state, "code" => "ENCODE", "message" => e);
-            return 1;
+            return Ok(1);
         }
     };
     let rows_idx = 5;
-    laux::lua_checktype(state, rows_idx, ffi::LUA_TTABLE);
+    laux::lua_checktype(state, rows_idx, ffi::LUA_TTABLE)
+        .map_err(|err| format!("pg.update_many: rows {err}"))?;
     let nrows = unsafe { ffi::lua_rawlen(state.as_ptr(), rows_idx) };
     if nrows == 0 {
         push_lua_table!(state, "code" => "ENCODE", "message" => "update_many: rows is empty");
-        return 1;
+        return Ok(1);
     }
     let key_type: Option<String> = if laux::lua_type(state, 6) == laux::LuaType::String {
-        let kt = unsafe { laux::lua_check_str(state, 6) }.to_string();
+        let kt = lua
+            .get::<String>(6)
+            .map_err(|err| format!("pg.update_many: {err}"))?;
         if let Err(e) = validate_type_name(&kt) {
             push_lua_table!(state, "code" => "ENCODE", "message" => format!("update_many: {}", e));
-            return 1;
+            return Ok(1);
         }
         Some(kt)
     } else {
         None
     };
 
-    laux::lua_checkstack(state, 4, std::ptr::null());
+    laux::lua_checkstack(state, 4, std::ptr::null())?;
     let options = JsonOptions::default();
     let cols_per_tuple = 1 + set_cols.len();
     let mut data = Vec::with_capacity(128 + table.len() + nrows * cols_per_tuple * 8);
@@ -1711,7 +1797,7 @@ fn update_many_impl(state: LuaState, forget: bool) -> c_int {
         build_update_sql(&table, &key, &set_cols, tuple_count, key_type.as_deref())
     };
     if let Err(err) = encode_many(
-        state,
+        lua,
         &mut data,
         rows_idx,
         nrows,
@@ -1720,18 +1806,23 @@ fn update_many_impl(state: LuaState, forget: bool) -> c_int {
         &build,
     ) {
         push_lua_table!(state, "code" => "ENCODE", "message" => err);
-        return 1;
+        return Ok(1);
     }
 
     if forget {
-        dispatch_forget(state, pool, data)
+        Ok(dispatch_forget(state, pool, data))
     } else {
-        dispatch_async(state, pool, data)
+        Ok(dispatch_async(state, pool, data))
     }
 }
 
-extern "C-unwind" fn pool_len(state: LuaState) -> c_int {
-    let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
+fn pool_len(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<PgPool>()
+        .expect("invalid pg pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
     let table = LuaTable::new(state, pool.inner.workers().len(), 0);
     for w in pool.inner.workers() {
         table.push(w.counter().load());
@@ -1739,8 +1830,13 @@ extern "C-unwind" fn pool_len(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn close(state: LuaState) -> c_int {
-    let pool = laux::lua_touserdata::<PgPool>(state, 1).expect("invalid pg pool pointer");
+fn close(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let pool_ptr = lua
+        .value(1)
+        .as_userdata::<PgPool>()
+        .expect("invalid pg pool pointer");
+    let pool = unsafe { pool_ptr.as_ref() };
     // Only remove our own entry: if a `connect()` with the same name has already
     // replaced this pool, closing through this (now stale) handle must not evict
     // the newer pool. Identify ourselves by the `inner` Arc.
@@ -1758,7 +1854,8 @@ extern "C-unwind" fn close(state: LuaState) -> c_int {
     1
 }
 
-extern "C-unwind" fn stats(state: LuaState) -> c_int {
+fn stats(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     let table = LuaTable::new(state, 0, PG_CONNECTIONS.len());
     PG_CONNECTIONS.iter().for_each(|pair| {
         let pool = &pair.value().inner;
@@ -2020,14 +2117,14 @@ pub unsafe extern "C-unwind" fn decode_pg_message(
 ) -> c_int {
     match unsafe { crate::message_decode::take_boxed::<PgResponse>(m) } {
         Ok(response) => push_pg_response(state, response),
-        Err(e) => crate::lua_push_error(state, &e),
+        Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
 
 pub extern "C-unwind" fn luaopen_pg(state: LuaState) -> c_int {
     let l = [
-        lreg!("connect", connect),
-        lreg!("find_connection", find_connection),
+        lreg_try!("connect", connect),
+        lreg_try!("find_connection", find_connection),
         lreg!("stats", stats),
         lreg_null!(),
     ];
@@ -2392,9 +2489,10 @@ mod tests {
     #[test]
     fn parse_url_defaults_and_alias() {
         // `postgresql` scheme alias, `pool_size` param alias, defaults elsewhere.
-        let cfg =
-            ConnectConfig::parse("postgresql://postgres:123456@127.0.0.1/postgres?name=c&pool_size=3")
-                .unwrap();
+        let cfg = ConnectConfig::parse(
+            "postgresql://postgres:123456@127.0.0.1/postgres?name=c&pool_size=3",
+        )
+        .unwrap();
         assert_eq!(cfg.params.port, 5432);
         assert_eq!(cfg.params.application_name, "moon");
         assert_eq!(cfg.name, "c");

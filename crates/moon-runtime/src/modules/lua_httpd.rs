@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use moon_base::laux::LuaState;
 use moon_base::{
     cstr, ffi, laux,
-    laux::{LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib,
+    laux::{LuaStack, LuaTable},
+    lreg, lreg_null, lreg_try, luaL_newlib,
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
@@ -522,32 +522,31 @@ async fn handle_request(
     }
 }
 
-extern "C-unwind" fn listen(state: LuaState) -> c_int {
+fn listen(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
     let _guard = CONTEXT.io_runtime().enter();
-
-    let addr = unsafe { laux::lua_check_str(state, 1) };
+    let state = lua.state();
 
     let has_opts = laux::lua_type(state, 2) == laux::LuaType::Table;
     let max_body_size: usize = if has_opts {
-        laux::opt_field(state, 2, "max_body_size").unwrap_or(DEFAULT_MAX_BODY_SIZE)
+        lua.opt_field(2, "max_body_size")
+            .unwrap_or(DEFAULT_MAX_BODY_SIZE)
     } else {
         DEFAULT_MAX_BODY_SIZE
     };
     let max_connections: usize = if has_opts {
-        laux::opt_field(state, 2, "max_connections").unwrap_or(LIMITS.listener_connections)
+        lua.opt_field(2, "max_connections")
+            .unwrap_or(LIMITS.listener_connections)
     } else {
         LIMITS.listener_connections
     };
     let static_dir: Option<Arc<PathBuf>> = if has_opts {
-        match laux::opt_field::<String>(state, 2, "static_dir") {
+        match lua.opt_field::<String>(2, "static_dir") {
             Some(s) => match PathBuf::from(&s).canonicalize() {
                 Ok(canonical) => Some(Arc::new(canonical)),
                 Err(e) => {
-                    // Drop the owned path string before the longjmp (`lua_error`
-                    // never returns, so its `Drop` would otherwise be skipped).
                     let msg = format!("httpd static_dir '{}' invalid: {}", s, e);
                     drop(s);
-                    laux::lua_error(state, msg);
+                    return Err(msg);
                 }
             },
             None => None,
@@ -556,31 +555,28 @@ extern "C-unwind" fn listen(state: LuaState) -> c_int {
         None
     };
 
+    let addr = match lua.value(1).as_str() {
+        Some(addr) => addr,
+        None => return Err("bad argument #1 (valid UTF-8 string expected)".to_string()),
+    };
+
     let socket_addr: SocketAddr = match addr.parse() {
         Ok(a) => a,
-        Err(e) => {
-            laux::lua_error(state, format!("httpd listen '{}' failed: {}", addr, e));
-        }
+        Err(e) => return Err(format!("httpd listen '{}' failed: {}", addr, e)),
     };
 
     let listener = match std::net::TcpListener::bind(socket_addr) {
         Ok(l) => l,
-        Err(e) => {
-            laux::lua_error(state, format!("httpd listen '{}' failed: {}", addr, e));
-        }
+        Err(e) => return Err(format!("httpd listen '{}' failed: {}", addr, e)),
     };
     if let Err(e) = listener.set_nonblocking(true) {
-        // Release the bound socket before the longjmp; otherwise `lua_error`
-        // skips the listener's `Drop` and leaks the file descriptor.
         let msg = format!("httpd listen '{}' failed: {}", addr, e);
         drop(listener);
-        laux::lua_error(state, msg);
+        return Err(msg);
     }
     let listener = match TcpListener::from_std(listener) {
         Ok(l) => l,
-        Err(e) => {
-            laux::lua_error(state, format!("httpd listen '{}' failed: {}", addr, e));
-        }
+        Err(e) => return Err(format!("httpd listen '{}' failed: {}", addr, e)),
     };
 
     let actor = LuaActor::from_lua_state(state);
@@ -636,7 +632,7 @@ extern "C-unwind" fn listen(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, fd);
-    1
+    Ok(1)
 }
 
 fn push_httpd_request(state: LuaState, req: HttpSrvRequest) -> c_int {
@@ -663,38 +659,42 @@ fn push_httpd_request(state: LuaState, req: HttpSrvRequest) -> c_int {
     2
 }
 
-extern "C-unwind" fn response(state: LuaState) -> c_int {
-    let handle = match laux::lua_touserdata::<ResponseHandle>(state, 1) {
+fn response(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let mut handle_ptr = match lua.value(1).as_userdata::<ResponseHandle>() {
         Some(h) => h,
         None => {
-            return crate::lua_push_error(state, "httpd response: null handle");
+            return crate::lua_push_error_tuple(state, "httpd response: null handle");
         }
     };
+    let handle = unsafe { handle_ptr.as_mut() };
     let tx = match handle.0.take() {
         Some(tx) => tx,
         None => {
-            return crate::lua_push_error(state, "httpd response: already consumed");
+            return crate::lua_push_error_tuple(state, "httpd response: already consumed");
         }
     };
 
-    let status: u16 = laux::lua_opt(state, 2).unwrap_or(200);
+    let status: u16 = lua.opt(2).unwrap_or(200);
 
     let mut headers = Vec::new();
     if laux::lua_type(state, 3) == laux::LuaType::Table {
-        let header_table = LuaTable::from_stack(state, 3);
-        for (key, value) in header_table.iter() {
+        for entry in lua.table_cursor(3) {
+            let key = entry.key();
+            let value = entry.value();
             let hk = key.to_string();
             let hv = value.to_string();
             headers.push((hk, hv));
         }
     }
 
-    let body = match LuaValue::from_stack(state, 4) {
-        LuaValue::String(s) => s.to_vec(),
-        _ => Vec::new(),
-    };
+    let body = lua
+        .value(4)
+        .as_bytes()
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default();
     if body.len() > LIMITS.max_network_read_bytes {
-        return crate::lua_push_error(
+        return crate::lua_push_error_tuple(
             state,
             &format!(
                 "httpd response: body of {} bytes exceeds limit of {} bytes",
@@ -716,22 +716,23 @@ extern "C-unwind" fn response(state: LuaState) -> c_int {
             laux::lua_push(state, true);
             1
         }
-        Err(_) => crate::lua_push_error(
+        Err(_) => crate::lua_push_error_tuple(
             state,
             "httpd response: request already completed (client disconnected or timed out)",
         ),
     }
 }
 
-extern "C-unwind" fn close(state: LuaState) -> c_int {
-    let fd: i64 = laux::lua_get(state, 1);
+fn close(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let fd: i64 = lua.get(1)?;
     if let Some((_, token)) = HTTP_SERVERS.remove(&fd) {
         token.cancel();
         laux::lua_push(state, true);
     } else {
         laux::lua_push(state, false);
     }
-    1
+    Ok(1)
 }
 
 pub unsafe extern "C-unwind" fn decode_httpd_message(
@@ -740,15 +741,15 @@ pub unsafe extern "C-unwind" fn decode_httpd_message(
 ) -> c_int {
     match unsafe { crate::message_decode::take_boxed::<HttpSrvRequest>(m) } {
         Ok(req) => push_httpd_request(state, req),
-        Err(e) => crate::lua_push_error(state, &e),
+        Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
 
 pub extern "C-unwind" fn luaopen_httpd(state: LuaState) -> c_int {
     let l = [
-        lreg!("listen", listen),
+        lreg_try!("listen", listen),
         lreg!("response", response),
-        lreg!("close", close),
+        lreg_try!("close", close),
         lreg_null!(),
     ];
 

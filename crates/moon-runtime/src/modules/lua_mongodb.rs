@@ -11,8 +11,8 @@ use mongodb::{
 };
 use moon_base::{
     cstr, ffi,
-    laux::{self, LuaArgs, LuaState, LuaTable, LuaValue},
-    lreg, lreg_null, luaL_newlib, push_lua_table,
+    laux::{self, LuaArgs, LuaStack, LuaState, LuaTable, LuaType},
+    lreg, lreg_null, lreg_try, luaL_newlib, push_lua_table,
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
@@ -255,7 +255,11 @@ where
                     return Err(err);
                 }
                 if failed_times == 0 {
-                    log::error!("mongodb '{}' network error: {}. retrying.", database_url, err);
+                    log::error!(
+                        "mongodb '{}' network error: {}. retrying.",
+                        database_url,
+                        err
+                    );
                 }
                 failed_times += 1;
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -585,12 +589,18 @@ async fn database_handler(
     }
 }
 
-extern "C-unwind" fn connect(state: LuaState) -> c_int {
+fn connect(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     let mut args = LuaArgs::new(1);
-    let database_url = unsafe { laux::lua_check_str(state, args.iter_arg()) };
-    let name = unsafe { laux::lua_check_str(state, args.iter_arg()) };
-    let queue_capacity: usize =
-        laux::lua_opt(state, args.iter_arg()).unwrap_or(crate::LIMITS.request_queue_capacity);
+    let database_url = lua
+        .get::<String>(args.iter_arg())
+        .map_err(|err| format!("mongodb.connect: {err}"))?;
+    let name = lua
+        .get::<String>(args.iter_arg())
+        .map_err(|err| format!("mongodb.connect: {err}"))?;
+    let queue_capacity: usize = lua
+        .opt(args.iter_arg())
+        .unwrap_or(crate::LIMITS.request_queue_capacity);
     let queue_capacity = queue_capacity.max(1);
 
     let actor = LuaActor::from_lua_state(state);
@@ -598,7 +608,7 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     let session = unsafe { (*actor).next_session() };
 
     CONTEXT.io_runtime().spawn(async move {
-        match DatabaseState::connect(context::PTYPE_MONGODB, database_url.to_string()).await {
+        match DatabaseState::connect(context::PTYPE_MONGODB, database_url).await {
             Ok(state) => {
                 let (tx, rx) = mpsc::channel(queue_capacity);
                 let counter = PendingCounter::new();
@@ -606,7 +616,7 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
                 // previous handler to close so its task and mongodb Client don't
                 // leak (it drains and fails any queued requests, then exits).
                 if let Some(old) = DATABASE_CONNECTIONSS.insert(
-                    name.to_string(),
+                    name.clone(),
                     DatabaseConnection {
                         name: name.to_string(),
                         tx: tx.clone(),
@@ -641,227 +651,259 @@ extern "C-unwind" fn connect(state: LuaState) -> c_int {
     });
 
     laux::lua_push(state, session);
-    1
+    Ok(1)
 }
 
-fn extract_find_options(options: LuaTable) -> Result<FindOptions, String> {
+fn extract_find_options(lua: &mut LuaStack<'_>, index: i32) -> Result<FindOptions, String> {
     let mut find_options = FindOptions::default();
-    for (key, value) in options.iter() {
-        if let LuaValue::String(name) = key {
-            let key = String::from_utf8_lossy(name).into_owned();
-            match key.as_str() {
-                "limit" => {
-                    if let LuaValue::Integer(val) = value {
-                        find_options.limit = Some(val);
-                    }
+    for mut entry in lua.table_cursor(index) {
+        let key = entry.key();
+        let Some(key) = key.as_bytes() else {
+            continue;
+        };
+        match key {
+            b"limit" => {
+                let value = entry.value();
+                if let Some(value) = value.as_integer() {
+                    find_options.limit = Some(value);
                 }
-                "skip" => {
-                    if let LuaValue::Integer(val) = value {
-                        find_options.skip = Some(val as u64);
-                    }
+            }
+            b"skip" => {
+                let value = entry.value();
+                if let Some(value) = value.as_integer() {
+                    find_options.skip = Some(value as u64);
                 }
-                "sort" => {
-                    if let LuaValue::Table(val) = value {
-                        let sort = table_to_doc(val)?;
-
-                        find_options.sort = Some(sort);
-                    } else {
+            }
+            b"sort" => {
+                let index = {
+                    let value = entry.value();
+                    if value.kind() != LuaType::Table {
                         return Err(format!("Invalid sort value type: {:?}", value.name()));
                     }
-                }
-                "projection" => {
-                    if let LuaValue::Table(val) = value {
-                        let projection = table_to_doc(val)?;
-                        find_options.projection = Some(projection);
-                    } else {
+                    value.index()
+                };
+                find_options.sort = Some(unsafe { table_to_doc(entry.lua_mut(), index) }?);
+            }
+            b"projection" => {
+                let index = {
+                    let value = entry.value();
+                    if value.kind() != LuaType::Table {
                         return Err(format!("Invalid projection value type: {:?}", value.name()));
                     }
+                    value.index()
+                };
+                find_options.projection = Some(unsafe { table_to_doc(entry.lua_mut(), index) }?);
+            }
+            b"max_time" => {
+                let value = entry.value();
+                if let Some(value) = value.as_integer() {
+                    find_options.max_time = Some(Duration::from_millis(value as u64));
                 }
-                "max_time" => {
-                    if let LuaValue::Integer(val) = value {
-                        find_options.max_time = Some(Duration::from_millis(val as u64));
-                    }
+            }
+            b"batch_size" => {
+                let value = entry.value();
+                if let Some(value) = value.as_integer() {
+                    find_options.batch_size = Some(value as u32);
                 }
-                "batch_size" => {
-                    if let LuaValue::Integer(val) = value {
-                        find_options.batch_size = Some(val as u32);
-                    }
+            }
+            b"allow_partial_results" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bool() {
+                    find_options.allow_partial_results = Some(value);
                 }
-                "allow_partial_results" => {
-                    if let LuaValue::Boolean(val) = value {
-                        find_options.allow_partial_results = Some(val);
-                    }
+            }
+            b"no_cursor_timeout" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bool() {
+                    find_options.no_cursor_timeout = Some(value);
                 }
-                "no_cursor_timeout" => {
-                    if let LuaValue::Boolean(val) = value {
-                        find_options.no_cursor_timeout = Some(val);
-                    }
-                }
-                "cursor_type" => {
-                    if let LuaValue::String(val) = value {
-                        match val {
-                            b"NonTailable" => {
-                                find_options.cursor_type =
-                                    Some(mongodb::options::CursorType::NonTailable);
-                            }
-                            b"Tailable" => {
-                                find_options.cursor_type =
-                                    Some(mongodb::options::CursorType::Tailable);
-                            }
-                            b"TailableAwait" => {
-                                find_options.cursor_type =
-                                    Some(mongodb::options::CursorType::TailableAwait);
-                            }
-                            _ => {
-                                return Err(format!(
-                                    "Invalid cursor type: {}",
-                                    String::from_utf8_lossy(val)
-                                ));
-                            }
+            }
+            b"cursor_type" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bytes() {
+                    find_options.cursor_type = Some(match value {
+                        b"NonTailable" => mongodb::options::CursorType::NonTailable,
+                        b"Tailable" => mongodb::options::CursorType::Tailable,
+                        b"TailableAwait" => mongodb::options::CursorType::TailableAwait,
+                        _ => {
+                            return Err(format!(
+                                "Invalid cursor type: {}",
+                                String::from_utf8_lossy(value)
+                            ));
                         }
-                    }
+                    });
                 }
-                "read_concern" => {
-                    if let LuaValue::String(val) = value {
-                        find_options.read_concern =
-                            Some(ReadConcern::custom(String::from_utf8_lossy(val)));
-                    }
+            }
+            b"read_concern" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bytes() {
+                    find_options.read_concern =
+                        Some(ReadConcern::custom(String::from_utf8_lossy(value)));
                 }
-                _ => {
-                    return Err(format!("Invalid find_options key: '{}'", key));
-                }
+            }
+            _ => {
+                return Err(format!(
+                    "Invalid find_options key: '{}'",
+                    String::from_utf8_lossy(key)
+                ));
             }
         }
     }
     Ok(find_options)
 }
 
-fn extract_create_index_options(options: LuaTable) -> Result<CreateIndexOptions, String> {
+fn extract_create_index_options(
+    lua: &mut LuaStack<'_>,
+    index: i32,
+) -> Result<CreateIndexOptions, String> {
     let mut create_index_options = CreateIndexOptions::default();
-    for (key, value) in options.iter() {
-        if let LuaValue::String(name) = key {
-            let key = String::from_utf8_lossy(name).into_owned();
-            match key.as_str() {
-                "max_time" => {
-                    if let LuaValue::Integer(val) = value {
-                        create_index_options.max_time = Some(Duration::from_secs(val as u64));
-                    }
-                }
-                _ => {
-                    return Err(format!("Invalid key: {}", key));
+    for entry in lua.table_cursor(index) {
+        let key = entry.key();
+        let Some(key) = key.as_bytes() else {
+            continue;
+        };
+        match key {
+            b"max_time" => {
+                let value = entry.value();
+                if let Some(value) = value.as_integer() {
+                    create_index_options.max_time = Some(Duration::from_secs(value as u64));
                 }
             }
+            _ => return Err(format!("Invalid key: {}", String::from_utf8_lossy(key))),
         }
     }
     Ok(create_index_options)
 }
 
-fn extract_index_options(table: LuaTable) -> Result<IndexOptions, String> {
+fn extract_index_options(lua: &mut LuaStack<'_>, index: i32) -> Result<IndexOptions, String> {
     let mut index_options = IndexOptions::default();
-    for (key, value) in table.iter() {
-        if let LuaValue::String(name) = key {
-            let key = String::from_utf8_lossy(name).into_owned();
-            match key.as_str() {
-                "name" => {
-                    if let LuaValue::String(val) = value {
-                        index_options.name = Some(String::from_utf8_lossy(val).into_owned());
-                    }
+    for mut entry in lua.table_cursor(index) {
+        let key = entry.key();
+        let Some(key) = key.as_bytes() else {
+            continue;
+        };
+        match key {
+            b"name" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bytes() {
+                    index_options.name = Some(String::from_utf8_lossy(value).into_owned());
                 }
-                "unique" => {
-                    if let LuaValue::Boolean(val) = value {
-                        index_options.unique = Some(val);
-                    }
+            }
+            b"unique" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bool() {
+                    index_options.unique = Some(value);
                 }
-                "background" => {
-                    if let LuaValue::Boolean(val) = value {
-                        index_options.background = Some(val);
-                    }
+            }
+            b"background" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bool() {
+                    index_options.background = Some(value);
                 }
-                "sparse" => {
-                    if let LuaValue::Boolean(val) = value {
-                        index_options.sparse = Some(val);
-                    }
+            }
+            b"sparse" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bool() {
+                    index_options.sparse = Some(value);
                 }
-                "storage_engine" => {
-                    if let LuaValue::Table(val) = value {
-                        index_options.storage_engine = Some(table_to_doc(val)?);
-                    } else {
+            }
+            b"storage_engine" => {
+                let index = {
+                    let value = entry.value();
+                    if value.kind() != LuaType::Table {
                         return Err(format!(
                             "Invalid storage_engine value type: {:?}",
                             value.name()
                         ));
                     }
-                }
-                "partial_filter_expression" => {
-                    if let LuaValue::Table(val) = value {
-                        let partial_filter_expression = table_to_doc(val)?;
-                        index_options.partial_filter_expression = Some(partial_filter_expression);
-                    } else {
+                    value.index()
+                };
+                index_options.storage_engine =
+                    Some(unsafe { table_to_doc(entry.lua_mut(), index) }?);
+            }
+            b"partial_filter_expression" => {
+                let index = {
+                    let value = entry.value();
+                    if value.kind() != LuaType::Table {
                         return Err(format!(
                             "Invalid partial_filter_expression value type: {:?}",
                             value.name()
                         ));
                     }
-                }
-                "wildcard_projection" => {
-                    if let LuaValue::Table(val) = value {
-                        index_options.wildcard_projection = Some(table_to_doc(val)?);
-                    } else {
+                    value.index()
+                };
+                index_options.partial_filter_expression =
+                    Some(unsafe { table_to_doc(entry.lua_mut(), index) }?);
+            }
+            b"wildcard_projection" => {
+                let index = {
+                    let value = entry.value();
+                    if value.kind() != LuaType::Table {
                         return Err(format!(
                             "Invalid wildcard_projection value type: {:?}",
                             value.name()
                         ));
                     }
-                }
-                "hidden" => {
-                    if let LuaValue::Boolean(val) = value {
-                        index_options.hidden = Some(val);
-                    }
-                }
-                "default_language" => {
-                    if let LuaValue::String(val) = value {
-                        index_options.default_language =
-                            Some(String::from_utf8_lossy(val).into_owned());
-                    }
-                }
-                "language_override" => {
-                    if let LuaValue::String(val) = value {
-                        index_options.language_override =
-                            Some(String::from_utf8_lossy(val).into_owned());
-                    }
-                }
-                "weights" => {
-                    if let LuaValue::Table(val) = value {
-                        let weights = table_to_doc(val)?;
-                        index_options.weights = Some(weights);
-                    } else {
-                        return Err(format!("Invalid weights value type: {:?}", value.name()));
-                    }
-                }
-                "bits" => {
-                    if let LuaValue::Integer(val) = value {
-                        index_options.bits = Some(val as u32);
-                    }
-                }
-                "max" => {
-                    if let LuaValue::Number(val) = value {
-                        index_options.max = Some(val);
-                    }
-                }
-                "min" => {
-                    if let LuaValue::Number(val) = value {
-                        index_options.min = Some(val);
-                    }
-                }
-                "bucket_size" => {
-                    if let LuaValue::Integer(val) = value {
-                        index_options.bucket_size = Some(val as u32);
-                    }
-                }
-                _ => {
-                    return Err(format!("Invalid key: {}", key));
+                    value.index()
+                };
+                index_options.wildcard_projection =
+                    Some(unsafe { table_to_doc(entry.lua_mut(), index) }?);
+            }
+            b"hidden" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bool() {
+                    index_options.hidden = Some(value);
                 }
             }
+            b"default_language" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bytes() {
+                    index_options.default_language =
+                        Some(String::from_utf8_lossy(value).into_owned());
+                }
+            }
+            b"language_override" => {
+                let value = entry.value();
+                if let Some(value) = value.as_bytes() {
+                    index_options.language_override =
+                        Some(String::from_utf8_lossy(value).into_owned());
+                }
+            }
+            b"weights" => {
+                let index = {
+                    let value = entry.value();
+                    if value.kind() != LuaType::Table {
+                        return Err(format!("Invalid weights value type: {:?}", value.name()));
+                    }
+                    value.index()
+                };
+                index_options.weights = Some(unsafe { table_to_doc(entry.lua_mut(), index) }?);
+            }
+            b"bits" => {
+                let value = entry.value();
+                if let Some(value) = value.as_integer() {
+                    index_options.bits = Some(value as u32);
+                }
+            }
+            b"max" => {
+                let value = entry.value();
+                if value.kind() == LuaType::Number {
+                    index_options.max = value.as_number();
+                }
+            }
+            b"min" => {
+                let value = entry.value();
+                if value.kind() == LuaType::Number {
+                    index_options.min = value.as_number();
+                }
+            }
+            b"bucket_size" => {
+                let value = entry.value();
+                if let Some(value) = value.as_integer() {
+                    index_options.bucket_size = Some(value as u32);
+                }
+            }
+            _ => return Err(format!("Invalid key: {}", String::from_utf8_lossy(key))),
         }
     }
     Ok(index_options)
@@ -873,7 +915,7 @@ fn make_request(
     db_name: String,
     collection_name: String,
     op_name: &str,
-    state: LuaState,
+    lua: &mut LuaStack<'_>,
     args: &mut LuaArgs,
 ) -> Result<DatabaseRequest, String> {
     let request = match op_name {
@@ -881,46 +923,47 @@ fn make_request(
             DatabaseRequest::CreateCollection(owner, session, db_name, collection_name)
         }
         "insert_one" => {
-            let doc = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let doc = table_to_doc(lua, args.iter_arg())?;
             DatabaseRequest::InsertOne(owner, session, db_name, collection_name, doc)
         }
         "insert_many" => {
-            let docs = LuaTable::from_stack(state, args.iter_arg())
-                .iter()
-                .map(|(_, doc)| lua_to_doc(doc))
-                .collect::<Result<Vec<Document>, String>>()?;
+            let mut docs = Vec::new();
+            for mut entry in lua.table_cursor(args.iter_arg()) {
+                let index = entry.value().index();
+                docs.push(unsafe { lua_to_doc(entry.lua_mut(), index) }?);
+            }
             DatabaseRequest::InsertMany(owner, session, db_name, collection_name, docs)
         }
         "delete_one" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let filter = table_to_doc(lua, args.iter_arg())?;
             DatabaseRequest::DeleteOne(owner, session, db_name, collection_name, filter)
         }
         "delete_many" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let filter = table_to_doc(lua, args.iter_arg())?;
             DatabaseRequest::DeleteMany(owner, session, db_name, collection_name, filter)
         }
         "update_one" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
-            let update = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let filter = table_to_doc(lua, args.iter_arg())?;
+            let update = table_to_doc(lua, args.iter_arg())?;
             DatabaseRequest::UpdateOne(owner, session, db_name, collection_name, filter, update)
         }
         "update_many" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
-            let update = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let filter = table_to_doc(lua, args.iter_arg())?;
+            let update = table_to_doc(lua, args.iter_arg())?;
             DatabaseRequest::UpdateMany(owner, session, db_name, collection_name, filter, update)
         }
         "find_one" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let filter = table_to_doc(lua, args.iter_arg())?;
             DatabaseRequest::FindOne(owner, session, db_name, collection_name, filter)
         }
         "find" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
-            let find_options =
-                if let LuaValue::Table(options) = LuaValue::from_stack(state, args.iter_arg()) {
-                    Some(extract_find_options(options)?)
-                } else {
-                    None
-                };
+            let filter = table_to_doc(lua, args.iter_arg())?;
+            let options_index = args.iter_arg();
+            let find_options = if lua.value(options_index).kind() == LuaType::Table {
+                Some(extract_find_options(lua, options_index)?)
+            } else {
+                None
+            };
 
             DatabaseRequest::Find(
                 owner,
@@ -932,8 +975,8 @@ fn make_request(
             )
         }
         "replace_one" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
-            let replacement = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let filter = table_to_doc(lua, args.iter_arg())?;
+            let replacement = table_to_doc(lua, args.iter_arg())?;
             DatabaseRequest::ReplacOne(
                 owner,
                 session,
@@ -944,29 +987,29 @@ fn make_request(
             )
         }
         "count" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let filter = table_to_doc(lua, args.iter_arg())?;
             DatabaseRequest::Count(owner, session, db_name, collection_name, filter)
         }
         "exists" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let filter = table_to_doc(lua, args.iter_arg())?;
             DatabaseRequest::Exists(owner, session, db_name, collection_name, filter)
         }
         "create_index" => {
-            let keys = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
+            let keys = table_to_doc(lua, args.iter_arg())?;
 
-            let index_options =
-                if let LuaValue::Table(options) = LuaValue::from_stack(state, args.iter_arg()) {
-                    Some(extract_index_options(options)?)
-                } else {
-                    None
-                };
+            let index_options_index = args.iter_arg();
+            let index_options = if lua.value(index_options_index).kind() == LuaType::Table {
+                Some(extract_index_options(lua, index_options_index)?)
+            } else {
+                None
+            };
 
-            let options =
-                if let LuaValue::Table(options) = LuaValue::from_stack(state, args.iter_arg()) {
-                    Some(extract_create_index_options(options)?)
-                } else {
-                    None
-                };
+            let options_index = args.iter_arg();
+            let options = if lua.value(options_index).kind() == LuaType::Table {
+                Some(extract_create_index_options(lua, options_index)?)
+            } else {
+                None
+            };
 
             let index = IndexModel::builder()
                 .keys(keys)
@@ -982,18 +1025,19 @@ fn make_request(
             )
         }
         "find_stream" => {
-            let filter = table_to_doc(LuaTable::from_stack(state, args.iter_arg()))?;
-            let find_options =
-                if let LuaValue::Table(options) = LuaValue::from_stack(state, args.iter_arg()) {
-                    Some(extract_find_options(options)?)
-                } else {
-                    None
-                };
+            let filter = table_to_doc(lua, args.iter_arg())?;
+            let options_index = args.iter_arg();
+            let find_options = if lua.value(options_index).kind() == LuaType::Table {
+                Some(extract_find_options(lua, options_index)?)
+            } else {
+                None
+            };
             // Parse as i64 so a negative Lua integer is rejected rather than
             // wrapping to a huge `usize`. `batch_size == 0` would make the
             // handler loop emit empty batches forever, so require >= 1.
-            let batch_size: i64 =
-                laux::lua_opt(state, args.iter_arg()).unwrap_or(crate::LIMITS.db_stream_batch_rows);
+            let batch_size: i64 = lua
+                .opt(args.iter_arg())
+                .unwrap_or(crate::LIMITS.db_stream_batch_rows);
             if batch_size < 1 || batch_size as u64 > crate::LIMITS.db_query_rows as u64 {
                 return Err(format!(
                     "find_stream: batch_size must be between 1 and {}",
@@ -1021,9 +1065,12 @@ fn make_request(
     Ok(request)
 }
 
-extern "C-unwind" fn lua_mongodb_close(state: LuaState) -> c_int {
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, 1)
+fn lua_mongodb_close(lua: &mut LuaStack<'_>) -> c_int {
+    let conn_ptr = lua
+        .value(1)
+        .as_userdata::<DatabaseConnection>()
         .expect("Invalid database connect pointer");
+    let conn = unsafe { conn_ptr.as_ref() };
     // Stop the handler task (drops the mongodb Client) and drop the registry
     // entry so a later reconnect with the same name doesn't collide with a
     // stale, dead handle.
@@ -1038,8 +1085,13 @@ extern "C-unwind" fn lua_mongodb_close(state: LuaState) -> c_int {
     0
 }
 
-extern "C-unwind" fn cursor_next(state: LuaState) -> c_int {
-    let handle = laux::lua_touserdata::<CursorHandle>(state, 1).expect("invalid cursor handle");
+fn cursor_next(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
+    let mut handle_ptr = lua
+        .value(1)
+        .as_userdata::<CursorHandle>()
+        .expect("invalid cursor handle");
+    let handle = unsafe { handle_ptr.as_mut() };
     if let Some(tx) = handle.0.take() {
         let actor = LuaActor::from_lua_state(state);
         let owner = unsafe { (*actor).id };
@@ -1048,32 +1100,42 @@ extern "C-unwind" fn cursor_next(state: LuaState) -> c_int {
         // send fails. Surface that as an error rather than pushing a session that
         // would never be answered (which would hang the awaiting coroutine).
         if tx.send(CursorSignal::Next(owner, session)).is_err() {
-            return crate::lua_push_error(state, "cursor: stream handler is gone");
+            return crate::lua_push_error_tuple(state, "cursor: stream handler is gone");
         }
         laux::lua_push(state, session);
         1
     } else {
-        crate::lua_push_error(state, "cursor: already consumed or closed")
+        crate::lua_push_error_tuple(state, "cursor: already consumed or closed")
     }
 }
 
-extern "C-unwind" fn cursor_close(state: LuaState) -> c_int {
-    let handle = laux::lua_touserdata::<CursorHandle>(state, 1).expect("invalid cursor handle");
+fn cursor_close(lua: &mut LuaStack<'_>) -> c_int {
+    let mut handle_ptr = lua
+        .value(1)
+        .as_userdata::<CursorHandle>()
+        .expect("invalid cursor handle");
+    let handle = unsafe { handle_ptr.as_mut() };
     if let Some(tx) = handle.0.take() {
         let _ = tx.send(CursorSignal::Close);
     }
     0
 }
 
-extern "C-unwind" fn operators(state: LuaState) -> c_int {
+fn operators(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     let mut args = LuaArgs::new(1);
 
-    let conn = laux::lua_touserdata::<DatabaseConnection>(state, args.iter_arg())
+    let conn_ptr = lua
+        .value(args.iter_arg())
+        .as_userdata::<DatabaseConnection>()
         .expect("Invalid database connect pointer");
+    let conn = unsafe { conn_ptr.as_ref() };
 
-    let op_name = unsafe { laux::lua_check_str(state, args.iter_arg()) };
-    let db_name = laux::lua_get(state, args.iter_arg());
-    let collection_name = laux::lua_get(state, args.iter_arg());
+    let op_name = lua
+        .get::<String>(args.iter_arg())
+        .map_err(|err| format!("mongodb.operators: {err}"))?;
+    let db_name: String = lua.get(args.iter_arg())?;
+    let collection_name: String = lua.get(args.iter_arg())?;
 
     let actor = LuaActor::from_lua_state(state);
     let owner = unsafe { (*actor).id };
@@ -1084,8 +1146,8 @@ extern "C-unwind" fn operators(state: LuaState) -> c_int {
         session,
         db_name,
         collection_name,
-        op_name,
-        state,
+        &op_name,
+        lua,
         &mut args,
     ) {
         Ok(request) => request,
@@ -1095,7 +1157,7 @@ extern "C-unwind" fn operators(state: LuaState) -> c_int {
                 "kind" => "ERROR",
                 "message" => err
             );
-            return 1;
+            return Ok(1);
         }
     };
 
@@ -1103,7 +1165,7 @@ extern "C-unwind" fn operators(state: LuaState) -> c_int {
         match conn.tx.try_send(request) {
             Ok(()) => {
                 laux::lua_push(state, true);
-                1
+                Ok(1)
             }
             Err(err) => {
                 push_lua_table!(
@@ -1111,7 +1173,7 @@ extern "C-unwind" fn operators(state: LuaState) -> c_int {
                     "kind" => "ERROR",
                     "message" => err.to_string()
                 );
-                1
+                Ok(1)
             }
         }
     } else {
@@ -1119,7 +1181,7 @@ extern "C-unwind" fn operators(state: LuaState) -> c_int {
             Ok(_) => {
                 conn.counter.inc();
                 laux::lua_push(state, session);
-                1
+                Ok(1)
             }
             Err(err) => {
                 push_lua_table!(
@@ -1127,7 +1189,7 @@ extern "C-unwind" fn operators(state: LuaState) -> c_int {
                     "kind" => "ERROR",
                     "message" => err.to_string()
                 );
-                1
+                Ok(1)
             }
         }
     }
@@ -1313,35 +1375,45 @@ fn push_mongodb_response(state: LuaState, result: DatabaseResponse) -> c_int {
     }
 }
 
-extern "C-unwind" fn find_connection(state: LuaState) -> c_int {
-    let name = unsafe { laux::lua_check_str(state, 1) };
-    match DATABASE_CONNECTIONSS.get(name) {
-        Some(pair) => {
+fn find_connection(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let connection = {
+        let name = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "mongodb.find_connection: UTF-8 string expected".to_string())?;
+        DATABASE_CONNECTIONSS
+            .get(name)
+            .map(|pair| pair.value().clone())
+    };
+    match connection {
+        Some(connection) => {
             let l = [
-                lreg!("operators", operators),
+                lreg_try!("operators", operators),
                 lreg!("close", lua_mongodb_close),
                 lreg_null!(),
             ];
             if laux::lua_newuserdata(
                 state,
-                pair.value().clone(),
+                connection,
                 cstr!("mongodb_connection_metatable"),
                 l.as_ref(),
             )
             .is_none()
             {
                 laux::lua_pushnil(state);
-                return 1;
+                return Ok(1);
             }
         }
         None => {
             laux::lua_pushnil(state);
         }
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn stats(state: LuaState) -> c_int {
+fn stats(lua: &mut LuaStack<'_>) -> c_int {
+    let state = lua.state();
     let table = LuaTable::new(state, 0, DATABASE_CONNECTIONSS.len());
     DATABASE_CONNECTIONSS.iter().for_each(|pair| {
         let counter = &pair.value().counter;
@@ -1358,65 +1430,76 @@ extern "C-unwind" fn stats(state: LuaState) -> c_int {
     1
 }
 
-fn lua_to_doc(value: LuaValue) -> Result<Document, String> {
-    match value {
-        LuaValue::Table(val) => table_to_doc(val),
-        val => Err(format!("Invalid type: {}", val.name())),
+fn lua_to_doc(lua: &mut LuaStack<'_>, index: i32) -> Result<Document, String> {
+    if lua.value(index).kind() == LuaType::Table {
+        table_to_doc(lua, index)
+    } else {
+        Err(format!("Invalid type: {}", lua.value(index).name()))
     }
 }
 
-fn table_to_doc(table: LuaTable) -> Result<Document, String> {
+fn table_to_doc(lua: &mut LuaStack<'_>, index: i32) -> Result<Document, String> {
     let mut doc = Document::new();
-    for (key, value) in table.iter() {
-        let key = match key {
-            LuaValue::String(val) => String::from_utf8(val.to_vec())
-                .map_err(|_| "Invalid document key: not valid UTF-8".to_string())?,
-            LuaValue::Number(val) => val.to_string(),
-            LuaValue::Integer(val) => val.to_string(),
-            val => return Err(format!("Invalid key type: {}", val.name())),
+    for mut entry in lua.table_cursor(index) {
+        let key = {
+            let key = entry.key();
+            match key.kind() {
+                LuaType::String => {
+                    String::from_utf8(key.as_bytes().unwrap_or_default().to_vec())
+                        .map_err(|_| "Invalid document key: not valid UTF-8".to_string())?
+                }
+                LuaType::Number => key.as_number().unwrap_or_default().to_string(),
+                LuaType::Integer => key.as_integer().unwrap_or_default().to_string(),
+                _ => return Err(format!("Invalid key type: {}", key.name())),
+            }
         };
         let is_object_id = key == "_id";
-        let value = lua_to_bson(value, is_object_id)?;
+        let index = entry.value().index();
+        let value = unsafe { lua_to_bson(entry.lua_mut(), index, is_object_id) }?;
         doc.insert(key, value);
     }
 
     Ok(doc)
 }
 
-fn table_to_bson(table: LuaTable) -> Result<Bson, String> {
-    let len = table.array_len();
+fn table_to_bson(lua: &mut LuaStack<'_>, index: i32) -> Result<Bson, String> {
+    let len = lua.array_len(index);
     if len > 0 {
         let mut arr = Vec::with_capacity(len);
-        for val in table.array_iter() {
-            arr.push(lua_to_bson(val, false)?);
+        let mut cursor = lua.array_cursor_len(index, len);
+        while let Some(value) = cursor.next() {
+            let index = value.index();
+            arr.push(unsafe { lua_to_bson(cursor.lua_mut(), index, false) }?);
         }
         return Ok(Bson::Array(arr));
     }
 
-    let doc = table_to_doc(table)?;
+    let doc = table_to_doc(lua, index)?;
 
     Ok(Bson::Document(doc))
 }
 
-fn lua_to_bson(value: LuaValue, is_object_id: bool) -> Result<Bson, String> {
-    match value {
-        LuaValue::Nil => Ok(Bson::Null),
-        LuaValue::Boolean(val) => Ok(Bson::Boolean(val)),
-        LuaValue::Number(val) => Ok(Bson::Double(val)),
-        LuaValue::Integer(val) => Ok(Bson::Int64(val)),
-        LuaValue::String(val) => {
-            let s =
-                std::str::from_utf8(val).map_err(|e| format!("Invalid UTF-8 in string: {}", e))?;
+fn lua_to_bson(lua: &mut LuaStack<'_>, index: i32, is_object_id: bool) -> Result<Bson, String> {
+    let value = lua.value(index);
+    match value.kind() {
+        LuaType::Nil => Ok(Bson::Null),
+        LuaType::Boolean => Ok(Bson::Boolean(value.as_bool().unwrap_or(false))),
+        LuaType::Number => Ok(Bson::Double(value.as_number().unwrap_or_default())),
+        LuaType::Integer => Ok(Bson::Int64(value.as_integer().unwrap_or_default())),
+        LuaType::String => {
+            let bytes = value.as_bytes().unwrap_or_default();
+            let s = std::str::from_utf8(bytes)
+                .map_err(|err| format!("Invalid UTF-8 in string: {err}"))?;
             if is_object_id {
                 Ok(Bson::ObjectId(
-                    oid::ObjectId::from_str(s).map_err(|e| e.to_string())?,
+                    oid::ObjectId::from_str(s).map_err(|err| err.to_string())?,
                 ))
             } else {
                 Ok(Bson::String(s.to_string()))
             }
         }
-        LuaValue::Table(val) => Ok(table_to_bson(val)?),
-        val => Err(format!("Invalid type: {}", val.name())),
+        LuaType::Table => table_to_bson(lua, index),
+        _ => Err(format!("Invalid type: {}", value.name())),
     }
 }
 
@@ -1454,12 +1537,12 @@ fn bson_to_lua(state: LuaState, value: &Bson) -> Result<(), String> {
     Ok(())
 }
 
-extern "C-unwind" fn tt(state: LuaState) -> c_int {
-    let table = LuaTable::from_stack(state, 1);
-    let doc = table_to_doc(table).unwrap();
+fn tt(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let doc = table_to_doc(lua, 1)?;
     let bson = Bson::Document(doc);
-    bson_to_lua(state, &bson).unwrap();
-    1
+    bson_to_lua(state, &bson)?;
+    Ok(1)
 }
 
 pub unsafe extern "C-unwind" fn decode_mongodb_message(
@@ -1468,20 +1551,104 @@ pub unsafe extern "C-unwind" fn decode_mongodb_message(
 ) -> c_int {
     match unsafe { crate::message_decode::take_boxed::<DatabaseResponse>(m) } {
         Ok(response) => push_mongodb_response(state, response),
-        Err(e) => crate::lua_push_error(state, &e),
+        Err(e) => crate::lua_push_error_tuple(state, &e),
     }
 }
 
 pub extern "C-unwind" fn luaopen_mongodb(state: LuaState) -> c_int {
     let l = [
-        lreg!("connect", connect),
-        lreg!("find_connection", find_connection),
+        lreg_try!("connect", connect),
+        lreg_try!("find_connection", find_connection),
         lreg!("stats", stats),
-        lreg!("tt", tt),
+        lreg_try!("tt", tt),
         lreg_null!(),
     ];
 
     luaL_newlib!(state, l);
 
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moon_base::laux::LuaGlobalState;
+    use std::ptr::{NonNull, null_mut};
+
+    fn new_state() -> (LuaState, LuaGlobalState) {
+        let state = NonNull::new(unsafe { ffi::luaL_newstate() }).expect("Lua state allocation");
+        let owner = LuaGlobalState::new(state);
+        (state, owner)
+    }
+
+    unsafe fn rawset(state: LuaState, key: &str, push_value: impl FnOnce()) {
+        laux::lua_push(state, key);
+        push_value();
+        unsafe { ffi::lua_rawset(state.as_ptr(), -3) };
+    }
+
+    #[test]
+    fn nested_bson_conversion_restores_the_lua_stack() {
+        let (state, _owner) = new_state();
+        unsafe {
+            ffi::lua_createtable(state.as_ptr(), 0, 4);
+            rawset(state, "_id", || {
+                laux::lua_push(state, "507f1f77bcf86cd799439011")
+            });
+            rawset(state, "name", || laux::lua_push(state, "moon"));
+            rawset(state, "nested", || {
+                ffi::lua_createtable(state.as_ptr(), 0, 3);
+                rawset(state, "enabled", || laux::lua_push(state, true));
+                rawset(state, "values", || {
+                    ffi::lua_createtable(state.as_ptr(), 3, 0);
+                    for value in 1_i64..=3 {
+                        laux::lua_push(state, value);
+                        ffi::lua_rawseti(state.as_ptr(), -2, value);
+                    }
+                });
+                rawset(state, "empty", || {
+                    ffi::lua_createtable(state.as_ptr(), 0, 0)
+                });
+            });
+        }
+
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+        let document = table_to_doc(&mut lua, 1).expect("nested document conversion");
+
+        assert_eq!(lua.top(), top);
+        assert_eq!(
+            document,
+            doc! {
+                "_id": oid::ObjectId::from_str("507f1f77bcf86cd799439011").unwrap(),
+                "name": "moon",
+                "nested": {
+                    "enabled": true,
+                    "values": [1_i64, 2_i64, 3_i64],
+                    "empty": {},
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn nested_bson_error_restores_the_lua_stack() {
+        let (state, _owner) = new_state();
+        unsafe {
+            ffi::lua_createtable(state.as_ptr(), 0, 1);
+            rawset(state, "nested", || {
+                ffi::lua_createtable(state.as_ptr(), 0, 1);
+                rawset(state, "bad", || {
+                    ffi::lua_pushlightuserdata(state.as_ptr(), null_mut())
+                });
+            });
+        }
+
+        let mut lua = unsafe { LuaStack::from_raw(state) };
+        let top = lua.top();
+        let error = table_to_doc(&mut lua, 1).expect_err("unsupported nested Lua value");
+
+        assert_eq!(error, "Invalid type: lightuserdata");
+        assert_eq!(lua.top(), top);
+    }
 }

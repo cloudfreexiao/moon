@@ -15,8 +15,8 @@ pub struct LuaActor {
     pub mem: isize,
     pub mem_limit: isize,
     pub mem_warning: isize,
-    /// Raw pointer to the per-actor Watchdog (kept alive by Arc<Watchdog> in
-    /// ActorEntry). Used by lua_coroutine.rs switchL and signal_hook via
+    /// Raw pointer to the per-actor `Watchdog` (kept alive by `Arc<Watchdog>` in
+    /// `ActorEntry`). Used by `lua_coroutine.rs` `switchL` and `signal_hook` via
     /// extraspace chain.
     pub watchdog: *const Watchdog,
 }

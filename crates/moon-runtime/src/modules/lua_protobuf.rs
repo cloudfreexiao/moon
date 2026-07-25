@@ -17,12 +17,8 @@ use std::ffi::CString;
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use moon_base::laux::LuaValue;
-use moon_base::{
-    cstr, ffi, laux,
-    laux::LuaState,
-    lreg, lreg_null, luaL_newlib,
-};
+use moon_base::laux::{LuaStack, LuaType};
+use moon_base::{cstr, ffi, laux, laux::LuaState, lreg_null, lreg_try, luaL_newlib};
 use moon_runtime::buffer::Buffer;
 
 const MAX_RECURSION_DEPTH: usize = 128;
@@ -126,10 +122,9 @@ impl FieldType {
             | FieldType::Enum
             | FieldType::Sint32
             | FieldType::Sint64 => WireType::Varint,
-            FieldType::String
-            | FieldType::Group
-            | FieldType::Message
-            | FieldType::Bytes => WireType::LengthDelimited,
+            FieldType::String | FieldType::Group | FieldType::Message | FieldType::Bytes => {
+                WireType::LengthDelimited
+            }
             FieldType::None => WireType::Unknown,
         }
     }
@@ -224,7 +219,7 @@ struct PbMessage {
     oneof_decl: Vec<CString>,
     fast_fields: [Option<usize>; 32],
     fields_by_number: FxHashMap<i32, usize>,
-    fields_by_name: FxHashMap<String, usize>,
+    fields_by_name: FxHashMap<Vec<u8>, usize>,
 }
 
 impl PbMessage {
@@ -232,7 +227,7 @@ impl PbMessage {
         for (idx, field) in self.all_fields.iter().enumerate() {
             self.fields_by_number.entry(field.number).or_insert(idx);
             self.fields_by_name
-                .entry(field.name.clone())
+                .entry(field.name.as_bytes().to_vec())
                 .or_insert(idx);
             if field.number >= 0 && (field.number as usize) < self.fast_fields.len() {
                 self.fast_fields[field.number as usize] = Some(idx);
@@ -253,7 +248,7 @@ impl PbMessage {
         self.find_field_by_number((tag >> 3) as i32)
     }
 
-    fn find_field_by_name(&self, name: &str) -> Option<&PbField> {
+    fn find_field_by_name(&self, name: &[u8]) -> Option<&PbField> {
         self.fields_by_name.get(name).map(|&i| &self.all_fields[i])
     }
 }
@@ -741,7 +736,7 @@ impl Protobuf {
             ));
         }
 
-        unsafe { ffi::luaL_checkstack(state.as_ptr(), 8, std::ptr::null()) };
+        laux::lua_checkstack(state, 8, std::ptr::null())?;
         let stack_base = unsafe { ffi::lua_gettop(state.as_ptr()) };
         self.fill_message(state, msg);
         let table_abs = abs_index(state, -1);
@@ -838,9 +833,7 @@ impl Protobuf {
             unsafe { ffi::lua_setfield(state.as_ptr(), table_abs, field.name_c.as_ptr()) };
 
             // oneof bookkeeping: also record which field is set under the oneof name.
-            if field.oneof_index >= 0
-                && (field.oneof_index as usize) < msg.oneof_decl.len()
-            {
+            if field.oneof_index >= 0 && (field.oneof_index as usize) < msg.oneof_decl.len() {
                 unsafe {
                     ffi::lua_pushlstring(
                         state.as_ptr(),
@@ -892,8 +885,8 @@ impl Protobuf {
         index: i32,
         depth: usize,
     ) -> Result<bool, String> {
-        let to_int = || unsafe { ffi::lua_tointegerx(state.as_ptr(), index, std::ptr::null_mut()) }
-            as i64;
+        let to_int =
+            || unsafe { ffi::lua_tointegerx(state.as_ptr(), index, std::ptr::null_mut()) } as i64;
         let to_num =
             || unsafe { ffi::lua_tonumberx(state.as_ptr(), index, std::ptr::null_mut()) } as f64;
 
@@ -1016,9 +1009,10 @@ impl Protobuf {
                 write_len_prefixed(buf, data_len);
                 Ok(data_len == 0)
             }
-            FieldType::None | FieldType::Group => {
-                Err(format!("encode: unsupported field type for '{}'", field.name))
-            }
+            FieldType::None | FieldType::Group => Err(format!(
+                "encode: unsupported field type for '{}'",
+                field.name
+            )),
         }
     }
 
@@ -1117,15 +1111,22 @@ impl Protobuf {
                 msg.full_name
             ));
         }
-        unsafe { ffi::luaL_checkstack(state.as_ptr(), 8, std::ptr::null()) };
+        laux::lua_checkstack(state, 8, std::ptr::null())?;
         let stack_base = unsafe { ffi::lua_gettop(state.as_ptr()) };
 
         let mut oneof_encoded = false;
         unsafe { ffi::lua_pushnil(state.as_ptr()) };
         while unsafe { ffi::lua_next(state.as_ptr(), -2) } != 0 {
             if unsafe { ffi::lua_type(state.as_ptr(), -2) } == ffi::LUA_TSTRING {
-                let key = unsafe { laux::lua_to_str(state, -2) };
-                if let Some(field) = msg.find_field_by_name(key) {
+                let mut len = 0;
+                let ptr = unsafe { ffi::lua_tolstring(state.as_ptr(), -2, &mut len) };
+                let key = if ptr.is_null() {
+                    &[][..]
+                } else {
+                    unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }
+                };
+                let field = msg.find_field_by_name(key);
+                if let Some(field) = field {
                     let value_abs = abs_index(state, -1);
                     if field.is_map {
                         self.encode_map(state, buf, field, value_abs, depth + 1)?;
@@ -1143,7 +1144,8 @@ impl Protobuf {
                         }
                         let origin_size = buf.write_pos();
                         write_wire_type(buf, field.number, field.wtype);
-                        let is_empty = self.write_field_value(state, buf, field, value_abs, depth)?;
+                        let is_empty =
+                            self.write_field_value(state, buf, field, value_abs, depth)?;
                         if is_empty && self.descriptor.ignore_empty {
                             buf.revert(buf.write_pos() - origin_size);
                         }
@@ -1431,7 +1433,13 @@ impl Loader {
             for fi in 0..self.all_messages[mi].all_fields.len() {
                 let (type_name, type_, label, explicit_packed, packed_set) = {
                     let f = &self.all_messages[mi].all_fields[fi];
-                    (f.type_name.clone(), f.type_, f.label, f.packed, f.packed_set)
+                    (
+                        f.type_name.clone(),
+                        f.type_,
+                        f.label,
+                        f.packed,
+                        f.packed_set,
+                    )
                 };
                 if !type_name.is_empty() {
                     if let Some(&idx) = messages.get(&type_name) {
@@ -1462,7 +1470,9 @@ impl Loader {
             for fi in 0..self.all_messages[mi].all_fields.len() {
                 let field = &self.all_messages[mi].all_fields[fi];
                 let msg_idx = field.message;
-                let is_map = msg_idx.map(|i| self.all_messages[i].is_map).unwrap_or(false);
+                let is_map = msg_idx
+                    .map(|i| self.all_messages[i].is_map)
+                    .unwrap_or(false);
                 if is_map {
                     let m = &self.all_messages[msg_idx.unwrap()];
                     if m.all_fields.len() != 2 {
@@ -1511,6 +1521,12 @@ fn do_load(data_slices: &[&[u8]]) -> Result<PbDescriptor, String> {
 // Thread-local encode buffer
 // =========================================================================
 
+/// Returns the reusable encoder buffer for the current Lua worker thread.
+///
+/// # Safety contract
+/// Protobuf encoding must not be re-entered on the same thread while the
+/// returned reference is live. In particular, a repeated table's `__index`
+/// metamethod must not call `protobuf.encode` recursively.
 fn get_thread_encode_buffer() -> &'static mut Buffer {
     thread_local! {
         static ENCODE_BUF: std::cell::UnsafeCell<Buffer> =
@@ -1523,37 +1539,51 @@ fn get_thread_encode_buffer() -> &'static mut Buffer {
 // Lua-facing functions
 // =========================================================================
 
-extern "C-unwind" fn pb_load(state: LuaState) -> c_int {
+fn pb_load(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     let nargs = unsafe { ffi::lua_gettop(state.as_ptr()) } as usize;
     if nargs == 0 {
-        laux::lua_error(state, "protobuf.load: expected at least 1 argument (FileDescriptorSet data)".into());
+        return Err("protobuf.load: expected at least 1 argument (FileDescriptorSet data)".into());
     }
-    // Collect each argument as a byte slice before handing them to do_load,
-    // so a late lua_check_lstring failure doesn't leave a partially-loaded
-    // descriptor in the global slot.
-    let mut slices: Vec<&[u8]> = Vec::with_capacity(nargs);
-    for i in 1..=nargs {
-        slices.push(unsafe { laux::lua_check_lstring(state, i as c_int) });
-    }
-    match do_load(&slices) {
+    // `do_load` parses synchronously and stores owned descriptor fields; it
+    // never retains the input slices. Keep the Lua strings rooted until parsing
+    // completes, then release the borrows before mutating the Lua stack.
+    let loaded = {
+        let slices: Vec<&[u8]> = (1..=nargs)
+            .map(|i| {
+                lua.value(i as c_int)
+                    .as_bytes()
+                    .ok_or_else(|| format!("protobuf.load: argument #{} must be a string", i))
+            })
+            .collect::<Result<_, _>>()?;
+        do_load(&slices)
+    };
+    match loaded {
         Ok(desc) => set_global_descriptor(Box::new(desc)),
-        Err(e) => laux::lua_error(state, format!("protobuf.load error: {}", e)),
+        Err(e) => return Err(format!("protobuf.load error: {}", e)),
     }
     laux::lua_push(state, true);
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn pb_encode(state: LuaState) -> c_int {
-    let cmd_name = unsafe { laux::lua_check_str(state, 1) };
-    laux::lua_checktype(state, 2, ffi::LUA_TTABLE);
+fn pb_encode(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    laux::lua_checktype(state, 2, ffi::LUA_TTABLE)
+        .map_err(|err| format!("protobuf.encode: argument #2 {err}"))?;
 
     let pb = match Protobuf::new() {
         Some(p) => p,
-        None => laux::lua_error(state, "protobuf.encode: descriptor not loaded".into()),
+        None => return Err("protobuf.encode: descriptor not loaded".into()),
     };
-    let msg = match pb.descriptor.find_message(cmd_name) {
-        Some(m) => m,
-        None => laux::lua_error(state, format!("protobuf.encode: message '{}' not found", cmd_name)),
+    let msg = {
+        let cmd_name = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "protobuf.encode: UTF-8 message name expected".to_string())?;
+        match pb.descriptor.find_message(cmd_name) {
+            Some(m) => m,
+            None => return Err(format!("protobuf.encode: message '{}' not found", cmd_name)),
+        }
     };
 
     let buf = get_thread_encode_buffer();
@@ -1561,41 +1591,74 @@ extern "C-unwind" fn pb_encode(state: LuaState) -> c_int {
     // The table to encode is at index 2.
     unsafe { ffi::lua_settop(state.as_ptr(), 2) };
     if let Err(e) = pb.encode_message(state, buf, msg, 0) {
-        laux::lua_error(state, format!("protobuf.encode error: {}", e));
+        return Err(format!("protobuf.encode error: {}", e));
     }
     laux::lua_push(state, buf.data());
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn pb_decode(state: LuaState) -> c_int {
-    let cmd_name = unsafe { laux::lua_check_str(state, 1) };
-    let data = if let LuaValue::LightUserData(ptr) = LuaValue::from_stack(state, 2) {
-        let len = laux::lua_get(state, 3);
-        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }
-    }else {
-        unsafe { laux::lua_check_lstring(state, 2) }
+fn pb_decode(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
+    let value = lua.value(2);
+    let data = match value.kind() {
+        LuaType::LightUserData => {
+            let len = lua
+                .get::<i64>(3)
+                .map_err(|_| "protobuf.decode: buffer length must be an integer".to_string())?;
+            if len < 0 {
+                return Err("protobuf.decode: buffer length must not be negative".to_string());
+            }
+            let ptr = value
+                .as_light_userdata()
+                .and_then(|ptr| std::ptr::NonNull::new(ptr.cast::<u8>()))
+                .ok_or_else(|| "protobuf.decode: non-null lightuserdata expected".to_string())?;
+            // SAFETY: the native buffer is owned by the Lua caller and remains
+            // valid for this synchronous decode call. No slice escapes.
+            unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len as usize) }
+        }
+        LuaType::String => {
+            // SAFETY: argument #2 remains rooted while decoding. `decode_message`
+            // only appends/updates the new result table and never replaces the
+            // source string slot, so its bytes stay valid for this synchronous call.
+            let bytes = unsafe { value.as_bytes_append_only() }
+                .ok_or_else(|| "protobuf.decode: string data is unavailable".to_string())?;
+            bytes
+        }
+        _ => {
+            return Err(format!(
+                "protobuf.decode: argument #2 must be a string or buffer, got {}",
+                value.name()
+            ));
+        }
     };
 
     let pb = match Protobuf::new() {
         Some(p) => p,
-        None => laux::lua_error(state, "protobuf.decode: descriptor not loaded".into()),
+        None => return Err("protobuf.decode: descriptor not loaded".into()),
     };
-    let msg = match pb.descriptor.find_message(cmd_name) {
-        Some(m) => m,
-        None => laux::lua_error(state, format!("protobuf.decode: message '{}' not found", cmd_name)),
+    let msg = {
+        let cmd_name = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "protobuf.decode: UTF-8 message name expected".to_string())?;
+        match pb.descriptor.find_message(cmd_name) {
+            Some(m) => m,
+            None => return Err(format!("protobuf.decode: message '{}' not found", cmd_name)),
+        }
     };
 
     let mut stream = StreamReader::new(data);
     if let Err(e) = pb.decode_message(state, &mut stream, msg, 0) {
-        laux::lua_error(state, format!("protobuf.decode error: {}", e));
+        return Err(format!("protobuf.decode error: {}", e));
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn pb_messages(state: LuaState) -> c_int {
+fn pb_messages(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     let descriptor = match get_global_descriptor() {
         Some(d) => d,
-        None => laux::lua_error(state, "protobuf.messages: descriptor not loaded".into()),
+        None => return Err("protobuf.messages: descriptor not loaded".into()),
     };
     unsafe {
         ffi::lua_createtable(state.as_ptr(), 0, descriptor.messages.len() as c_int);
@@ -1605,30 +1668,38 @@ extern "C-unwind" fn pb_messages(state: LuaState) -> c_int {
         laux::lua_push(state, descriptor.all_messages[idx].name.as_str());
         unsafe { ffi::lua_rawset(state.as_ptr(), -3) };
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn pb_fields(state: LuaState) -> c_int {
-    let full_name = unsafe { laux::lua_check_str(state, 1) };
+fn pb_fields(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     let descriptor = match get_global_descriptor() {
         Some(d) => d,
-        None => laux::lua_error(state, "protobuf.fields: descriptor not loaded".into()),
+        None => return Err("protobuf.fields: descriptor not loaded".into()),
+    };
+    let msg = {
+        let full_name = lua
+            .value(1)
+            .as_str()
+            .ok_or_else(|| "protobuf.fields: UTF-8 message name expected".to_string())?;
+        descriptor.find_message(full_name)
     };
     unsafe { ffi::lua_createtable(state.as_ptr(), 0, 16) };
-    if let Some(msg) = descriptor.find_message(full_name) {
+    if let Some(msg) = msg {
         for field in &msg.all_fields {
             laux::lua_push(state, field.name.as_str());
             laux::lua_push(state, field.type_ as i64);
             unsafe { ffi::lua_rawset(state.as_ptr(), -3) };
         }
     }
-    1
+    Ok(1)
 }
 
-extern "C-unwind" fn pb_enums(state: LuaState) -> c_int {
+fn pb_enums(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
+    let state = lua.state();
     let descriptor = match get_global_descriptor() {
         Some(d) => d,
-        None => laux::lua_error(state, "protobuf.enums: descriptor not loaded".into()),
+        None => return Err("protobuf.enums: descriptor not loaded".into()),
     };
     unsafe { ffi::lua_createtable(state.as_ptr(), descriptor.enums.len() as c_int, 0) };
     let mut i: ffi::lua_Integer = 0;
@@ -1637,17 +1708,17 @@ extern "C-unwind" fn pb_enums(state: LuaState) -> c_int {
         i += 1;
         unsafe { ffi::lua_rawseti(state.as_ptr(), -2, i) };
     }
-    1
+    Ok(1)
 }
 
 pub extern "C-unwind" fn luaopen_protobuf(state: LuaState) -> c_int {
     let l = [
-        lreg!("load", pb_load),
-        lreg!("encode", pb_encode),
-        lreg!("decode", pb_decode),
-        lreg!("messages", pb_messages),
-        lreg!("fields", pb_fields),
-        lreg!("enums", pb_enums),
+        lreg_try!("load", pb_load),
+        lreg_try!("encode", pb_encode),
+        lreg_try!("decode", pb_decode),
+        lreg_try!("messages", pb_messages),
+        lreg_try!("fields", pb_fields),
+        lreg_try!("enums", pb_enums),
         lreg_null!(),
     ];
 
@@ -1724,11 +1795,7 @@ mod tests {
         let mut bar = Vec::new();
         put_len(&mut bar, 1, b"Bar");
         put_len(&mut bar, 2, &field_proto("foo", 1, 1, 11, ".test.Foo")); // message
-        put_len(
-            &mut bar,
-            2,
-            &field_proto("m", 2, 3, 11, ".test.Bar.MEntry"),
-        ); // repeated map entry
+        put_len(&mut bar, 2, &field_proto("m", 2, 3, 11, ".test.Bar.MEntry")); // repeated map entry
         put_len(&mut bar, 3, &mentry); // nested_type
 
         // FileDescriptorProto
@@ -1829,12 +1896,7 @@ mod tests {
     }
 
     /// Synthetic `<name>` map-entry message (key=1, value=2, map_entry=true).
-    fn map_entry(
-        name: &str,
-        key_type: u32,
-        val_type: u32,
-        val_type_name: &str,
-    ) -> Vec<u8> {
+    fn map_entry(name: &str, key_type: u32, val_type: u32, val_type_name: &str) -> Vec<u8> {
         msg(
             name,
             &[
@@ -2120,7 +2182,15 @@ mod tests {
         let testmap = msg(
             "TestMap",
             &[
-                fld("map", 1, L_REPEATED, T_MESSAGE, ".TestMap.MapEntry", None, None),
+                fld(
+                    "map",
+                    1,
+                    L_REPEATED,
+                    T_MESSAGE,
+                    ".TestMap.MapEntry",
+                    None,
+                    None,
+                ),
                 fld(
                     "packed_map",
                     2,
@@ -2198,7 +2268,15 @@ mod tests {
         );
         let outter = msg(
             "Outter",
-            &[fld("msg", 1, L_OPTIONAL, T_MESSAGE, ".TestOneof", None, None)],
+            &[fld(
+                "msg",
+                1,
+                L_OPTIONAL,
+                T_MESSAGE,
+                ".TestOneof",
+                None,
+                None,
+            )],
             &[],
             &[],
             false,
@@ -2237,7 +2315,10 @@ mod tests {
                 &[],
                 false,
             )],
-            &[enum_proto("Color", &[("Red", 0), ("Green", 1), ("Blue", 2)])],
+            &[enum_proto(
+                "Color",
+                &[("Red", 0), ("Green", 1), ("Blue", 2)],
+            )],
         );
         set_global_bytes(state, "_d", &set);
         let code = r#"
@@ -2322,8 +2403,30 @@ mod tests {
             -- unknown message names
             assert(not pcall(pb.encode, "Nope", {}), "unknown message encode must error")
             assert(not pcall(pb.decode, "Nope", ""), "unknown message decode must error")
+
+            local ok, err = pcall(pb.decode, "M", 42)
+            assert(not ok, "non-string decode input must error")
+            assert(tostring(err):find("argument #2 must be a string or buffer", 1, true),
+                "decode input error should identify argument #2: " .. tostring(err))
         "#;
         run(state, code).expect("error paths");
+
+        let location_error = run(
+            state,
+            r#"
+                local pb = require("protobuf")
+                pb.decode("M", 42)
+            "#,
+        )
+        .expect_err("unprotected decode error should be raised");
+        assert!(
+            location_error.starts_with("[string"),
+            "missing Lua source location: {location_error}"
+        );
+        assert!(
+            location_error.contains("argument #2 must be a string or buffer"),
+            "decode error should identify argument #2: {location_error}"
+        );
     }
 
     /// Varint-heavy encode/decode throughput. Ignored by default; run with:
