@@ -2182,7 +2182,7 @@ name = "moon-rua"
 version = "0.1.0"
 dependencies = [
  "moon-runtime",
- "rua-resources",
+ "rua-common",
  "ruac",
 ]
 
@@ -2889,28 +2889,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "rua-core"
-version = "0.1.0"
-
-[[package]]
-name = "rua-lex"
-version = "0.1.0"
-dependencies = [
- "rua-core",
-]
-
-[[package]]
-name = "rua-project"
-version = "0.1.0"
-dependencies = [
- "rua-core",
- "serde",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "rua-resources"
-version = "0.1.0"
+name = "rua-common"
+version = "0.1.1"
+source = "git+https://github.com/sniper00/rua-lang#22bd838ad24c8437e3bfc6ace10a40129df0dc95"
 dependencies = [
  "include_dir",
  "serde",
@@ -2919,12 +2900,10 @@ dependencies = [
 
 [[package]]
 name = "ruac"
-version = "0.1.0"
+version = "0.1.1"
+source = "git+https://github.com/sniper00/rua-lang#22bd838ad24c8437e3bfc6ace10a40129df0dc95"
 dependencies = [
- "rua-core",
- "rua-lex",
- "rua-project",
- "rua-resources",
+ "rua-common",
  "serde",
  "serde_json",
  "toml 0.8.23",
