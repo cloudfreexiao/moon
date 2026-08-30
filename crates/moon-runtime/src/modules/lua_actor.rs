@@ -10,7 +10,6 @@ use moon_runtime::{
     actor::LuaActor,
     check_buffer,
     context::{self, CONTEXT, LOGGER, LuaActorParam, Message, MessageBody, Watchdog},
-    loader::{LuaErrorContext, LuaErrorPhase, install_module_searcher, load_chunk},
     log::Logger,
 };
 use tokio::sync::mpsc;
@@ -79,32 +78,15 @@ fn lua_actor_protect_init_impl(lua: &mut LuaStack<'_>) -> Result<c_int, String> 
 
         luaopen_custom_libs(state);
 
-        let loader = CONTEXT.module_loader();
-        if let Some(loader) = loader.as_ref() {
-            if let Err(error) = install_module_searcher(state, loader.clone()) {
-                return Err(format!("install Rua module loader failed: {error}"));
-            }
-        }
-
-        let load_status = loader
-            .as_ref()
-            .and_then(|loader| loader.load_entry((*param).source.as_str()))
-            .map(|chunk| load_chunk(state, &chunk))
-            .unwrap_or_else(|| {
-                let source = CString::new((*param).source.as_str()).unwrap();
-                ffi::luaL_loadfile(state.as_ptr(), source.as_ptr())
-            });
-        if load_status != ffi::LUA_OK {
+        let source = CString::new((*param).source.as_str()).unwrap();
+        if ffi::luaL_loadfile(state.as_ptr(), source.as_ptr()) != ffi::LUA_OK {
             return Ok(1);
         }
-
         let params = CString::new((*param).params.as_str()).unwrap();
         if ffi::luaL_dostring(state.as_ptr(), params.as_ptr()) != ffi::LUA_OK {
             return Ok(1);
         }
 
-        drop(loader);
-        drop(params);
         ffi::lua_call(state.as_ptr(), 1, 0);
 
         Ok(0)
@@ -362,14 +344,7 @@ pub fn init(
         if ffi::lua_pcall(main_state, 1, ffi::LUA_MULTRET, trace_fn) != ffi::LUA_OK
             || ffi::lua_gettop(main_state) != 1
         {
-            let raw = stack_error_string(state);
-            let context = LuaErrorContext {
-                actor_id: params.id,
-                actor_name: params.name.clone(),
-                source: params.source.clone(),
-                phase: LuaErrorPhase::Init,
-            };
-            let formatted = CONTEXT.format_lua_error(&context, &raw);
+            let formatted = stack_error_string(state);
             return Err(format!("init actor failed: {formatted}"));
         }
 
@@ -421,17 +396,7 @@ fn handle(actor: &mut LuaActor, m: &mut Message) {
             ffi::LUA_ERRERR => "error in error".to_string(),
             _ => "unknown error".to_string(),
         };
-        let context = LuaErrorContext {
-            actor_id: actor.id,
-            actor_name: actor.name.clone(),
-            source: actor.source.clone(),
-            phase: LuaErrorPhase::Dispatch,
-        };
-        let formatted = CONTEXT.format_lua_error(&context, &raw);
-        let err = format!(
-            "actor '{}' dispatch message error:\n{}",
-            actor.name, formatted
-        );
+        let err = format!("actor '{}' dispatch message error:\n{}", actor.name, raw);
 
         laux::lua_pop(LuaState::new(callback_state).unwrap(), 1);
 
