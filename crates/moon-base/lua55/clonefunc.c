@@ -42,7 +42,7 @@ lproto(lua_State *L) {
 	return 2;
 }
 
-int LUAMOD_API
+LUAMOD_API int
 luaopen_clonefunc(lua_State *L) {
 	luaL_checkversion(L);
 	luaL_Reg l[] = {
