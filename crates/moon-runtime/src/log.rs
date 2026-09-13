@@ -263,6 +263,16 @@ impl Logger {
         log_file: Option<String>,
         log_level: String,
     ) -> Result<(), Box<dyn Error>> {
+        // These two settings must apply whether or not a logfile was
+        // requested. Previously they only ran inside the `log_file` branch,
+        // so a purely console-based run silently ignored the configured level
+        // (staying at the Debug default) and could not be told to stop writing
+        // to stdout.
+        self.state
+            .enable_stdout
+            .store(enable_stdout, Ordering::Release);
+        self.set_log_level(Logger::string_to_level(log_level));
+
         if let Some(file) = log_file {
             let path = Path::new(&file);
             if let Some(parent) = path.parent() {
@@ -275,10 +285,6 @@ impl Logger {
                 .open(file.clone())
             {
                 let _ = self.sender.send(LogMessage::File(file));
-                self.state
-                    .enable_stdout
-                    .store(enable_stdout, Ordering::Release);
-                self.set_log_level(Logger::string_to_level(log_level));
             } else {
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::NotFound,

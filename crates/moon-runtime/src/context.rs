@@ -954,7 +954,6 @@ pub struct LuaActorParam {
     pub name: String,
     pub source: String,
     pub params: String,
-    pub block: bool,
 }
 
 #[cfg(test)]
@@ -971,7 +970,6 @@ mod tests {
             name: name.to_string(),
             source: String::new(),
             params: String::new(),
-            block: false,
         }
     }
 

@@ -292,7 +292,7 @@ fn dispatch_batch(
 pub fn new_actor(params: LuaActorParam) {
     let (tx, rx) = mpsc::unbounded_channel();
 
-    if params.unique {
+    if params.unique && params.id != context::BOOTSTRAP_ACTOR_ADDR {
         let handle = std::thread::Builder::new()
             .name(format!("actor-{}", params.name))
             .spawn(move || {
@@ -543,7 +543,6 @@ fn lua_new_actor(lua: &mut LuaStack<'_>) -> Result<c_int, String> {
         name,
         source,
         params,
-        block: false,
     });
 
     laux::lua_push(state, session);

@@ -27,11 +27,64 @@ fn stack_error_message(lua: &LuaStack<'_>) -> String {
         .unwrap_or_else(|| "unknown error".to_string())
 }
 
+/// Escapes `value` for use as the body of a Lua single-quoted string literal.
+/// Backslash (the escape introducer) and the closing quote would otherwise
+/// terminate or reinterpret the literal; control characters cannot appear
+/// literally and are mapped to their Lua escapes. This keeps an argv value from
+/// breaking out of the `return {..}` chunk it is spliced into below.
+fn lua_string_body(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("\\'"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn print_usage() {
     println!("Usage:");
     println!("    moon_rs script.lua [args]\n");
     println!("Examples:");
     println!("    moon_rs main.lua hello\n");
+}
+
+fn find_runtime_root_from(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|candidate| candidate.join("lualib").is_dir())
+        .map(Path::to_path_buf)
+}
+
+fn find_runtime_root(bootstrap_path: &Path) -> Result<PathBuf> {
+    let current_dir = env::current_dir()?.canonicalize()?;
+    if let Some(root) = find_runtime_root_from(&current_dir) {
+        return Ok(root);
+    }
+
+    if let Some(parent) = bootstrap_path.parent()
+        && let Some(root) = find_runtime_root_from(parent)
+    {
+        return Ok(root);
+    }
+
+    let executable = env::current_exe()?.canonicalize()?;
+    if let Some(parent) = executable.parent()
+        && let Some(root) = find_runtime_root_from(parent)
+    {
+        return Ok(root);
+    }
+
+    Err(Error::Custom(format!(
+        "lualib dir not found from current directory, bootstrap {}, or executable {}",
+        bootstrap_path.display(),
+        executable.display()
+    )))
 }
 
 fn setup_signal() {
@@ -56,12 +109,7 @@ fn setup_signal() {
                     _= stream_quit.recv() =>(SIGQUIT, "quit")
                 };
 
-                log::warn!(
-                    "'{}' signal received, stopping system... ({}:{})",
-                    v.1,
-                    file!(),
-                    line!()
-                );
+                log::warn!("'{}' signal received, stopping system...", v.1);
                 CONTEXT.shutdown(v.0);
             }
         });
@@ -85,11 +133,7 @@ fn setup_signal() {
 
             match ctrl_type {
                 CTRL_C_EVENT => {
-                    log::warn!(
-                        "CTRL_C_EVENT received, stopping system... ({}:{})",
-                        file!(),
-                        line!()
-                    );
+                    log::warn!("CTRL_C_EVENT received, stopping system...");
                     CONTEXT.shutdown(CTRL_C_EVENT as i32);
                     1
                 }
@@ -122,7 +166,24 @@ fn setup_signal() {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        if let Error::ExitCode(code) = error {
+            // `moon.exit(code)` / a shutdown event intentionally becomes the
+            // process exit code. Negative codes mark an unrecoverable error
+            // (e.g. a failed bootstrap) whose cause was already logged; report
+            // the abnormal exit instead of leaving it silent.
+            if code < 0 {
+                eprintln!("Error: system failed with exit code {code}");
+            }
+            std::process::exit(code);
+        }
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Could not install default TLS provider");
@@ -154,7 +215,9 @@ async fn async_main() -> Result<()> {
         return Err(Error::Custom("invalid arguments".to_string()));
     }
 
-    let mut bootstrap = args[argn].clone();
+    argn += 1;
+    let mut bootstrap = args[argn - 1].clone();
+
     let path = Path::new(&bootstrap);
     if !path.is_file() {
         print_usage();
@@ -174,18 +237,18 @@ async fn async_main() -> Result<()> {
 
     let bootstrap_path = path.canonicalize()?;
 
-    argn += 1;
-
     let mut arg = String::new();
     arg.push_str("return {");
     for v in args.iter().skip(argn) {
-        arg.push_str(&format!("'{}',", v));
+        // Splice each argument as a single-quoted Lua literal. Command-line
+        // arguments are untrusted input, so the value is escaped (see
+        // `lua_string_body`) rather than interpolated verbatim.
+        arg.push_str(&format!("'{}',", lua_string_body(v)));
     }
     arg.push('}');
 
     let contents = fs::read_to_string(&bootstrap_path)?;
     if contents.contains("_G[\"__init__\"]") {
-        let contents = contents.as_str();
         //has init options
         unsafe {
             let lua = LuaState::new(ffi::luaL_newstate());
@@ -232,43 +295,39 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    if CONTEXT.get_env("PATH").is_none() {
-        let mut search_path = env::current_dir()?.canonicalize()?;
-        if !search_path.join("lualib").is_dir() {
-            search_path = env::current_exe()?.canonicalize()?.join("lualib");
+    // The runtime root (a directory containing `lualib`) is used to build the
+    // default `package.path`/`package.cpath`. Discovery is required only when
+    // the `__init__` config above did not supply its own `path`; otherwise it is
+    // best-effort, so a standalone bootstrap with no `lualib` ancestor can still
+    // start (a root that *is* found then still exposes its sibling `clib`
+    // directory for C extensions).
+    let runtime_root = match find_runtime_root(&bootstrap_path) {
+        Ok(root) => Some(root),
+        Err(error) if CONTEXT.get_env("PATH").is_none() => return Err(error),
+        Err(_) => None,
+    };
+    // Strip a Windows verbatim-path `\\?\` prefix so the Lua search templates
+    // below stay portable.
+    let runtime_root = runtime_root.map(|root| {
+        root.to_string_lossy()
+            .strip_prefix(r"\\?\")
+            .map(PathBuf::from)
+            .unwrap_or(root)
+    });
+
+    if let Some(root) = runtime_root.as_deref() {
+        let strpath = root.to_string_lossy().replace('\\', "/");
+
+        if CONTEXT.get_env("PATH").is_none() {
+            // Lualib directories are added to the Lua search path.
+            let package_path = format!("package.path='{}/lualib/?.lua;'..package.path;", strpath);
+            CONTEXT.set_env("PATH", package_path.as_bytes());
         }
 
-        if !search_path.is_dir() {
-            return Err(Error::Custom(format!(
-                "lualib dir not found: {}",
-                search_path.to_str().unwrap_or("")
-            )));
-        }
-
-        if let Some(path_with_no_prefix) = search_path.to_string_lossy().strip_prefix(r"\\?\") {
-            search_path = PathBuf::from(path_with_no_prefix);
-        }
-
-        let strpath = search_path.to_string_lossy().replace('\\', "/");
-        //Lualib directories are added to the lua search path
-        let package_path = format!("package.path='{}/lualib/?.lua;'..package.path;", strpath);
-
-        CONTEXT.set_env("PATH", package_path.as_bytes());
-    }
-
-    // Lua C dynamic extension libraries are loaded via `require` from the `clib`
-    // directory (alongside `lualib`). Append a search template to package.cpath so
-    // every actor inherits it (see CONTEXT env "PATH" propagation in lua_actor).
-    {
-        let mut root = env::current_dir()?.canonicalize()?;
-        if !root.join("lualib").is_dir() {
-            root = env::current_exe()?.canonicalize()?;
-            root.pop();
-        }
-        if let Some(stripped) = root.to_string_lossy().strip_prefix(r"\\?\") {
-            root = PathBuf::from(stripped);
-        }
-        let root = root.to_string_lossy().replace('\\', "/");
+        // Lua C dynamic extension libraries are loaded via `require` from the
+        // `clib` directory (alongside `lualib`). Append a search template to
+        // package.cpath so every actor inherits it (see CONTEXT env "PATH"
+        // propagation in lua_actor).
 
         // Platform-specific shared library extension.
         let ext = if cfg!(target_os = "windows") {
@@ -281,7 +340,7 @@ async fn async_main() -> Result<()> {
 
         let cpath = format!(
             "package.cpath='{root}/clib/?.{ext};'..package.cpath;",
-            root = root,
+            root = strpath,
             ext = ext
         );
 
@@ -341,7 +400,6 @@ async fn async_main() -> Result<()> {
         name: "bootstrap".to_string(),
         source: bootstrap,
         params: package_path,
-        block: true,
     });
 
     let mut last_report = std::time::Instant::now();
@@ -391,7 +449,7 @@ async fn async_main() -> Result<()> {
     }
 
     if error_code != 0 {
-        return Err(error_code.to_string().into());
+        return Err(Error::ExitCode(error_code));
     }
 
     Ok(())
