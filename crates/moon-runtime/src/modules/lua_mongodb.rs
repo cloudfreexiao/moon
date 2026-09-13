@@ -1221,7 +1221,13 @@ fn push_mongodb_response(state: LuaState, result: DatabaseResponse) -> c_int {
         DatabaseResponse::InsertMany(res) => {
             LuaTable::new(state, 0, res.inserted_ids.len());
             for (i, id) in res.inserted_ids.iter() {
-                laux::lua_push(state, *i);
+                // The driver keys `inserted_ids` by the 0-based position of the
+                // document in the input array; Lua arrays are 1-based, so shift
+                // so `result[k]` corresponds to the k-th document passed to
+                // `insert_many` (its own `_id` when supplied, else the one the
+                // server generated). Without the shift every id landed under a
+                // 0..n-1 key that `#result`/`ipairs(result)` would ignore.
+                laux::lua_push(state, *i as i64 + 1);
                 if let Err(err) = bson_to_lua(state, id) {
                     push_lua_table!(
                         state,

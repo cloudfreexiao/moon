@@ -535,17 +535,30 @@ impl PgConn {
         let mut txn_status = b'I';
         // Total DataRow messages accumulated across all statements in this reply.
         let mut total_rows: usize = 0;
+        // Set once the cumulative row count exceeds `db_query_rows`. The reply
+        // keeps being drained to ReadyForQuery so the connection stays
+        // synchronized and reusable; the overflow is then reported below as a
+        // query-level error instead of an `Err`, which the worker treats as a
+        // socket failure and would answer by reconnecting and re-executing the
+        // same request forever (see the retry loop in `worker_loop`).
+        let row_cap = crate::LIMITS.db_query_rows;
+        let mut rows_exceeded = false;
 
         loop {
             let (t, body) = self.read_message().await?;
             match t {
                 b'D' => {
+                    if rows_exceeded {
+                        // Over the cap already: drain and drop further rows.
+                        continue;
+                    }
                     total_rows += 1;
-                    if total_rows > crate::LIMITS.db_query_rows {
-                        return Err(format!(
-                            "query returned more than {} rows; use a streaming/paginated query for large result sets",
-                            crate::LIMITS.db_query_rows
-                        ));
+                    if total_rows > row_cap {
+                        rows_exceeded = true;
+                        // Discard rows buffered so far for the current statement
+                        // so a truncated statement is never reported complete.
+                        cur_rows.clear();
+                        continue;
                     }
                     cur_rows.push(body);
                 }
@@ -571,6 +584,24 @@ impl PgConn {
                 }
                 _ => {}
             }
+        }
+
+        if rows_exceeded && error.is_none() {
+            // SQLSTATE 54000 (program_limit_exceeded): the server ran the query,
+            // but the reply exceeded the client-side buffer cap. The connection
+            // is healthy, so this must not look like a transport failure.
+            error = Some(Box::new(DbError {
+                severity: None,
+                code: Some("54000".to_string()),
+                message: Some(format!(
+                    "query returned more than {row_cap} rows; use a streaming/paginated query for large result sets"
+                )),
+                position: None,
+                detail: None,
+                schema: None,
+                table: None,
+                constraint: None,
+            }));
         }
 
         Ok(QueryResult {

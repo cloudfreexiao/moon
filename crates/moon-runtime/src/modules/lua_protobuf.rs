@@ -706,6 +706,15 @@ impl Protobuf {
             };
             self.decode_field(state, &mut sub, kvfield, depth)?;
             if kvfield.number == 1 {
+                if has_key {
+                    // Duplicate key inside one map entry (possible with a
+                    // truncated or malicious stream). A map entry is just a
+                    // message, so the last key wins: drop the previously-pushed
+                    // key sitting just below the new one. This keeps at most one
+                    // key pending on the stack so the trailing `lua_pop`s below
+                    // stay balanced instead of leaking a value into the caller.
+                    unsafe { ffi::lua_remove(state.as_ptr(), -2) };
+                }
                 has_key = true;
             } else if kvfield.number == 2 && has_key {
                 unsafe { ffi::lua_rawset(state.as_ptr(), map_abs) };
@@ -1133,7 +1142,19 @@ impl Protobuf {
                     } else if field.is_repeated() {
                         self.encode_repeated(state, buf, field, value_abs, depth)?;
                     } else {
-                        if field.oneof_index >= 0 {
+                        // A oneof member that `ignore_empty` drops (empty
+                        // string / zero / empty message) is treated as absent:
+                        // it must neither count toward the oneof nor trip the
+                        // multiple-set check below. Only members that are
+                        // actually committed conflict, so the exclusivity flag
+                        // is set after the empty-drop decision.
+                        let origin_size = buf.write_pos();
+                        write_wire_type(buf, field.number, field.wtype);
+                        let is_empty =
+                            self.write_field_value(state, buf, field, value_abs, depth)?;
+                        if is_empty && self.descriptor.ignore_empty {
+                            buf.revert(buf.write_pos() - origin_size);
+                        } else if field.oneof_index >= 0 {
                             if oneof_encoded {
                                 return Err(format!(
                                     "encode: multiple oneof fields set in '{}'",
@@ -1141,13 +1162,6 @@ impl Protobuf {
                                 ));
                             }
                             oneof_encoded = true;
-                        }
-                        let origin_size = buf.write_pos();
-                        write_wire_type(buf, field.number, field.wtype);
-                        let is_empty =
-                            self.write_field_value(state, buf, field, value_abs, depth)?;
-                        if is_empty && self.descriptor.ignore_empty {
-                            buf.revert(buf.write_pos() - origin_size);
                         }
                     }
                 }
@@ -2700,6 +2714,101 @@ mod tests {
             ns(fx_d),
             (ns(fx_d) - ns(std_d)) / ns(std_d) * 100.0
         );
+    }
+
+    #[test]
+    #[serial]
+    fn protobuf_map_entry_duplicate_key_no_stack_leak() {
+        let (state, _guard) = new_vm();
+        set_global_bytes(state, "_desc", &build_descriptor_set());
+
+        // test.Bar.m is map<string,int32> (Bar field #2). Craft two malformed
+        // map entries by hand:
+        //   _mal1: entry with key "a", then key "b", then value 5 (two keys).
+        //   _mal2: entry with key "a", then key "b" and nothing else (truncated).
+        // decode_map must treat the entry like a message (last key wins) and
+        // must never leave a stray key on the Lua stack, which used to leak a
+        // value into the caller and corrupt the whole decode result.
+        let key = |s: &str| {
+            let mut e = Vec::new();
+            put_len(&mut e, 1, s.as_bytes()); // field #1 key (string)
+            e
+        };
+        let mut mal1 = key("a");
+        mal1.extend(key("b"));
+        put_var(&mut mal1, 2, 5); // field #2 value (int32)
+
+        let mut mal2 = key("a");
+        mal2.extend(key("b"));
+
+        let wrap_bar = |entry: &[u8]| {
+            let mut bar = Vec::new();
+            put_len(&mut bar, 2, entry); // Bar field #2 = m
+            bar
+        };
+        set_global_bytes(state, "_mal1", &wrap_bar(&mal1));
+        set_global_bytes(state, "_mal2", &wrap_bar(&mal2));
+
+        let code = r#"
+            local pb = require("protobuf")
+            assert(pb.load(_desc), "load failed")
+            local t = pb.decode("test.Bar", _mal1)
+            assert(type(t) == "table", "decode returned " .. type(t))
+            assert(t.m.b == 5, "duplicate key: last key should win")
+            assert(t.m.a == nil, "duplicate key: dropped key must not appear")
+            local t2 = pb.decode("test.Bar", _mal2)
+            assert(type(t2) == "table", "truncated decode returned " .. type(t2))
+            assert(next(t2.m) == nil, "key without value must not be inserted")
+        "#;
+        run(state, code).expect("duplicate map key must not corrupt decode");
+    }
+
+    #[test]
+    #[serial]
+    fn protobuf_oneof_empty_member_ignored() {
+        let (state, _guard) = new_vm();
+
+        // message One { oneof choice { string a = 1; string b = 2; } }
+        let one = msg(
+            "One",
+            &[
+                fld("a", 1, L_OPTIONAL, T_STRING, "", None, Some(0)),
+                fld("b", 2, L_OPTIONAL, T_STRING, "", None, Some(0)),
+            ],
+            &[],
+            &["choice"],
+            false,
+        );
+        set_global_bytes(
+            state,
+            "_desc",
+            &file_set(Some("proto3"), "test", &[one], &[]),
+        );
+
+        let code = r#"
+            local pb = require("protobuf")
+            assert(pb.load(_desc), "load failed")
+
+            -- a="" is empty; ignore_empty treats it as unset, so this is a
+            -- single-member oneof and must encode instead of erroring with
+            -- "multiple oneof fields set".
+            local bytes = pb.encode("test.One", { a = "", b = "hi" })
+            local t = pb.decode("test.One", bytes)
+            assert(type(t) == "table", "decode returned " .. type(t))
+            assert(t.b == "hi", "b should roundtrip: " .. tostring(t.b))
+
+            -- all members empty: nothing committed, no conflict
+            assert(pcall(pb.encode, "test.One", { a = "", b = "" }))
+
+            -- genuinely two committed members are still rejected
+            local ok, err = pcall(pb.encode, "test.One", { a = "x", b = "y" })
+            assert(not ok, "two committed oneof members must error")
+            assert(
+                type(err) == "string" and err:find("multiple oneof", 1, true),
+                "error should name the conflict: " .. tostring(err)
+            )
+        "#;
+        run(state, code).expect("oneof empty members must not count as set");
     }
 
     /// Isolated varint read/write throughput (no Lua). Compares the optimized

@@ -23,7 +23,7 @@ use moon_base::{
 };
 use moon_runtime::actor::LuaActor;
 use moon_runtime::context::{self, ActorId, CONTEXT};
-use std::{ffi::c_int, sync::Arc, time::Duration};
+use std::{collections::VecDeque, ffi::c_int, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -276,8 +276,17 @@ struct WatchMessageWait {
     session: i64,
 }
 
+/// Cap on pub/sub messages buffered while no coroutine is waiting on this
+/// watch. Messages are never dropped merely because a waiter was not pending
+/// at the instant they arrived (see `watch_loop`), but a subscriber that stops
+/// calling `message()` must not grow memory without bound either.
+const MAX_BUFFERED_WATCH_MESSAGES: usize = 1024;
+
 async fn watch_loop(mut conn: RedisConn, mut rx: mpsc::UnboundedReceiver<WatchOp>) {
     let mut pending_wait: Option<WatchMessageWait> = None;
+    // Deliveries that arrived while no waiter was pending, kept in arrival
+    // order for the next `WaitMessage` op.
+    let mut buffered: VecDeque<RedisReply> = VecDeque::with_capacity(64);
 
     loop {
         tokio::select! {
@@ -312,11 +321,22 @@ async fn watch_loop(mut conn: RedisConn, mut rx: mpsc::UnboundedReceiver<WatchOp
                         }
                     }
                     Some(WatchOp::WaitMessage { owner, session }) => {
-                        // Only one waiter is supported per watch connection. A
-                        // second concurrent wait must not silently replace the
-                        // first (that would hang the first coroutine forever):
-                        // reject the new request and keep the existing waiter.
-                        if pending_wait.is_some() {
+                        // A delivery may already be buffered (one that arrived
+                        // between subscribe and this wait): serve it immediately
+                        // rather than leaving the new waiter blocked while a
+                        // message sits queued.
+                        if let Some(reply) = buffered.pop_front() {
+                            let _ = CONTEXT.send_value(
+                                context::PTYPE_REDIS,
+                                owner,
+                                session,
+                                RedisResponse::WatchMessage(reply),
+                            );
+                        } else if pending_wait.is_some() {
+                            // Only one waiter is supported per watch connection. A
+                            // second concurrent wait must not silently replace the
+                            // first (that would hang the first coroutine forever):
+                            // reject the new request and keep the existing waiter.
                             let _ = CONTEXT.send_value(
                                 context::PTYPE_REDIS,
                                 owner,
@@ -342,7 +362,38 @@ async fn watch_loop(mut conn: RedisConn, mut rx: mpsc::UnboundedReceiver<WatchOp
                                 wait.session,
                                 RedisResponse::WatchMessage(r),
                             );
+                        } else {
+                            // No waiter right now — buffer instead of dropping.
+                            // (Bounded: a subscriber that never reads again is
+                            // failing to keep up; the oldest delivery is evicted
+                            // rather than growing memory forever.)
+                            if buffered.len() == MAX_BUFFERED_WATCH_MESSAGES {
+                                buffered.pop_front();
+                            }
+                            buffered.push_back(r);
                         }
+                    }
+                    // A bare error reply on this connection can only be a
+                    // rejected SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE (e.g. NOAUTH or a
+                    // channel ACL denial). `send_command` above only detects
+                    // transport errors, so without this arm the rejection was
+                    // silently discarded: subscribe() had returned `true` and the
+                    // next message() wait hung forever. Surface it to any pending
+                    // waiter; if nobody is waiting, the failure is unreportable
+                    // through the fire-and-forget subscribe() API, so shut the
+                    // connection down so the next operation fails loudly
+                    // ("watch closed") instead of the Lua side believing it is
+                    // subscribed when it is not.
+                    Ok(RedisReply::Error(e)) => {
+                        if let Some(wait) = pending_wait.take() {
+                            let _ = CONTEXT.send_value(
+                                context::PTYPE_REDIS,
+                                wait.owner,
+                                wait.session,
+                                RedisResponse::Error(e),
+                            );
+                        }
+                        break;
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -361,10 +412,10 @@ async fn watch_loop(mut conn: RedisConn, mut rx: mpsc::UnboundedReceiver<WatchOp
         }
     }
 
-    // The loop is exiting (explicit Close, all senders dropped, or a read
-    // error already handled above). If a waiter is still pending, wake it with
-    // an error instead of leaving the Lua coroutine blocked on `moon.wait`
-    // forever.
+    // The loop is exiting (explicit Close, all senders dropped, a rejected
+    // subscribe, or a read error already handled above). If a waiter is still
+    // pending, wake it with an error instead of leaving the Lua coroutine
+    // blocked on `moon.wait` forever.
     if let Some(wait) = pending_wait.take() {
         let _ = CONTEXT.send_value(
             context::PTYPE_REDIS,
